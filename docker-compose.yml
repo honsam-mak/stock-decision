@@ -1,0 +1,33 @@
+services:
+  backend:
+    build: ./backend
+    container_name: sds-backend
+    restart: unless-stopped
+    environment:
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-http://opensearch:9200}
+      OPENSEARCH_USER: ${OPENSEARCH_USER:-}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-}
+      INDEX_PREFIX: ${INDEX_PREFIX:-sds}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      ALPHA_VANTAGE_KEY: ${ALPHA_VANTAGE_KEY:-}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    networks:
+      - opensearch-net
+
+  frontend:
+    build: ./frontend
+    container_name: sds-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    networks:
+      - opensearch-net
+
+networks:
+  # Reuses the network of the OpenSearch container already running locally.
+  opensearch-net:
+    external: true
