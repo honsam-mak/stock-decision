@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .venv/
 supabase/.temp/
+.vercel
+.env.local
+.env.*.local
