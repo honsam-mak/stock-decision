@@ -2,6 +2,17 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { db, collection, doc, setDoc, onSnapshot, deleteDoc, getDoc, writeBatch } from './lib/firestoreShim.js';
 import { api } from './lib/api.js';
+import {
+  LOCAL_USER,
+  getCurrentSession,
+  isCloudAuthEnabled,
+  onSessionChange,
+  sendMagicLink,
+  sessionUser,
+  signInWithPassword,
+  signOut,
+} from './lib/auth.js';
+import { createBackup, parseBackup } from './lib/backup.js';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, LabelList, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
 import { 
   TrendingUp, TrendingDown, LayoutDashboard, ListTodo, Database, 
@@ -14,10 +25,7 @@ import {
 const SYSTEM_VERSION = "beta v0.83";
 
 // --- 1. Local backend (replaces Firebase) ---
-// Data lives in OpenSearch behind the FastAPI service; there is no login, so a
-// fixed local identity stands in for the Firebase anonymous user.
 const appId = 'stock-decision-system';
-const LOCAL_USER = { uid: 'local' };
 
 // --- 2. i18n Dictionary ---
 const TRANSLATIONS = {
@@ -36,6 +44,11 @@ const TRANSLATIONS = {
     "登入失敗，請重新載入": "Login failed, please reload",
     "資料智慧合併匯入成功！": "Data merged successfully!",
     "匯入失敗：檔案格式不正確": "Import failed: Invalid format",
+    "確認匯入備份": "Confirm backup import",
+    "將合併以下資料，不會刪除現有資料": "The following data will be merged; existing data will not be deleted",
+    "模擬": "simulations",
+    "交易紀錄": "records",
+    "行情快取": "market cache entries",
     
     // Dashboard & Settings
     "交易大廳總覽": "Dashboard Overview",
@@ -111,6 +124,28 @@ const TRANSLATIONS = {
     "只顯示已結算交易": "Show settled trades only",
     "獲利": "Gained",
     "虧損": "Loss",
+    "平倉交易": "Close Trade",
+    "平倉": "Close",
+    "執行": "Execute",
+    "平倉動作": "Close Action",
+    "目前未平倉數量": "Open Quantity",
+    "成交價（每股／每份）": "Execution Price (per share/contract)",
+    "履約價": "Strike Price",
+    "原始 premium": "Original premium",
+    "原始動作": "Original Action",
+    "將新增交易": "The following transaction will be added",
+    "確認交易": "Confirm Trade",
+    "交易已儲存！": "Trade saved successfully!",
+    "請輸入有效的價格": "Please enter a valid price.",
+    "請輸入有效的數量": "Please enter a valid quantity.",
+    "平倉數量不可超過未平倉數量": "Close quantity cannot exceed open quantity.",
+    "請輸入有效的日期": "Please enter a valid date.",
+    "找不到有效的未平倉數量": "No valid open quantity was found.",
+    "原交易數量": "Original Quantity",
+    "Option 名稱缺少 Call/Put": "The option name is missing Call/Put.",
+    "無法解析履約價，請輸入履約價": "Strike price could not be parsed; please enter it.",
+    "點擊以平倉": "Click to close this trade",
+    "到期／執行日期": "Expiration/Execution Date",
 
     // AI Features & Chat
     "✨ AI 洞察": "✨ AI Insights",
@@ -299,6 +334,33 @@ const parseExpiryDate = (assetName) => {
         return new Date(parseInt(match2[1]), parseInt(match2[2]) - 1, parseInt(match2[3]));
     }
     return new Date(2099, 11, 31); 
+};
+
+const isOptionTrade = (trade) => {
+    const assetName = String(trade?.assetName || '');
+    return String(trade?.assetClass || '').toLowerCase() === 'option'
+        || /Call|Put/i.test(assetName)
+        || Number(trade?.multiplier || 1) > 1;
+};
+
+const parseOptionDetails = (assetName) => {
+    const name = String(assetName || '');
+    const typeMatch = name.match(/\b(Call|Put)\b/i);
+    const optionType = typeMatch ? typeMatch[1].toLowerCase() : null;
+    const strikeMatch = name.match(/\$?(\d+(?:\.\d+)?)\s*(?=Call|Put\b)/i);
+    const strike = strikeMatch ? Number(strikeMatch[1]) : null;
+
+    return {
+        optionType,
+        strike: Number.isFinite(strike) ? strike : null
+    };
+};
+
+const getLocalDateInputValue = (date = new Date()) => {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
 };
 
 const generateFallbackStockHistory = (symbol, days = 600) => {
@@ -1917,6 +1979,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [selectedStockForDetail, setSelectedStockForDetail] = useState(null);
   const [selectedMonthForDetail, setSelectedMonthForDetail] = useState(null); 
+  const [selectedTradeForClose, setSelectedTradeForClose] = useState(null);
   const [selectedStockForSchedule, setSelectedStockForSchedule] = useState(null);
   const [cardViews, setCardViews] = useState({}); 
   const [showOnlyRealized, setShowOnlyRealized] = useState(true);
@@ -1946,7 +2009,16 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
 
   const pnlByStock = useMemo(() => {
     const pnlMap = {};
-    const sortedRecords = records.map(r => ({ ...r })).sort((a, b) => new Date(a.date) - new Date(b.date));
+    const sortedRecords = records
+      .map((record, index) => ({ record, index }))
+      .sort((a, b) => {
+        const dateDiff = new Date(a.record.date) - new Date(b.record.date);
+        if (dateDiff !== 0) return dateDiff;
+
+        const createdAtDiff = Number(a.record.createdAt || 0) - Number(b.record.createdAt || 0);
+        return createdAtDiff !== 0 ? createdAtDiff : a.index - b.index;
+      })
+      .map(({ record }) => ({ ...record }));
     
     sortedRecords.forEach(record => {
         if (!pnlMap[record.symbol]) {
@@ -1973,6 +2045,71 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
         const isBuy = record.action.toUpperCase() === 'BUY';
         const isExpire = record.action.toUpperCase() === 'EXPIRE';
         const isLoss = record.action.toUpperCase() === 'LOSS';
+
+        const consumeOpenLots = (quantity, sourceTradeId) => {
+            let remaining = Math.max(0, Number(quantity) || 0);
+            const consumed = [];
+            let usedLinkedLot = false;
+
+            while (remaining > 0 && lots.queue.length > 0) {
+                let targetIndex = 0;
+                if (sourceTradeId) {
+                    const linkedIndex = lots.queue.findIndex(
+                        lot => lot.id === sourceTradeId && Number(lot.openQty) > 0
+                    );
+                    if (linkedIndex !== -1) {
+                        targetIndex = linkedIndex;
+                        usedLinkedLot = true;
+                    }
+                }
+
+                const target = lots.queue[targetIndex];
+                const targetOpenQty = Number(target.openQty) || 0;
+                if (targetOpenQty <= 0) {
+                    lots.queue.splice(targetIndex, 1);
+                    continue;
+                }
+
+                const consumedQty = Math.min(targetOpenQty, remaining);
+                consumed.push({ lot: target, qty: consumedQty });
+                target.openQty = targetOpenQty - consumedQty;
+                remaining -= consumedQty;
+
+                if (target.openQty <= 0) {
+                    lots.queue.splice(targetIndex, 1);
+                }
+            }
+
+            if (lots.queue.length === 0) lots.direction = 0;
+            return { remaining, consumed, usedLinkedLot };
+        };
+
+        const getConsumedAverageCost = (consumed) => {
+            const totalQty = consumed.reduce((sum, item) => sum + item.qty, 0);
+            if (totalQty <= 0) return Number(pos.avgCost) || 0;
+
+            const totalCost = consumed.reduce(
+                (sum, item) => sum + (Number(item.lot.price) || 0) * item.qty,
+                0
+            );
+            return totalCost / totalQty;
+        };
+
+        const syncAverageCostFromLots = () => {
+            const openQty = lots.queue.reduce((sum, lot) => sum + (Number(lot.openQty) || 0), 0);
+            if (openQty > 0) {
+                const totalCost = lots.queue.reduce(
+                    (sum, lot) => sum + (Number(lot.price) || 0) * (Number(lot.openQty) || 0),
+                    0
+                );
+                pos.avgCost = totalCost / openQty;
+            } else if (pos.qty === 0) {
+                pos.avgCost = 0;
+            }
+        };
+
+        let consumedLots = [];
+        let usedLinkedLot = false;
         
         const addRealizedPnL = (amount) => {
              if (amount === 0) return;
@@ -1989,37 +2126,19 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
             record.openQty = 0; 
             isRealizing = true; 
             record.realizedPnL = 0;
-            let remainingToClose = qty;
-            while(remainingToClose > 0 && lots.queue.length > 0) {
-                const oldest = lots.queue[0];
-                if (oldest.openQty <= remainingToClose) {
-                    remainingToClose -= oldest.openQty;
-                    oldest.openQty = 0;
-                    lots.queue.shift();
-                } else {
-                    oldest.openQty -= remainingToClose;
-                    remainingToClose = 0;
-                }
-            }
-            if (lots.queue.length === 0) lots.direction = 0;
+            const consumedResult = consumeOpenLots(qty, record.sourceTradeId);
+            consumedLots = consumedResult.consumed;
+            usedLinkedLot = consumedResult.usedLinkedLot;
         } else {
             const tradeDir = isBuy ? 1 : -1;
             if (lots.direction === 0 || lots.direction === tradeDir) {
                 lots.direction = tradeDir;
                 lots.queue.push(record);
             } else {
-                let remainingToClose = qty;
-                while(remainingToClose > 0 && lots.queue.length > 0) {
-                    const oldest = lots.queue[0];
-                    if (oldest.openQty <= remainingToClose) {
-                        remainingToClose -= oldest.openQty;
-                        oldest.openQty = 0;
-                        lots.queue.shift();
-                    } else {
-                        oldest.openQty -= remainingToClose;
-                        remainingToClose = 0;
-                    }
-                }
+                const consumedResult = consumeOpenLots(qty, record.sourceTradeId);
+                consumedLots = consumedResult.consumed;
+                usedLinkedLot = consumedResult.usedLinkedLot;
+                const remainingToClose = consumedResult.remaining;
                 if (remainingToClose > 0) {
                     record.openQty = remainingToClose;
                     lots.direction = tradeDir;
@@ -2035,8 +2154,10 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
             if (pos.qty !== 0) {
                 const closeQty = Math.min(qty, Math.abs(pos.qty));
                 const isShort = pos.qty < 0;
-                
-                const pnl = (isShort ? pos.avgCost : -pos.avgCost) * closeQty * mult;
+                const basis = usedLinkedLot && consumedLots.length > 0
+                    ? getConsumedAverageCost(consumedLots)
+                    : pos.avgCost;
+                const pnl = (isShort ? basis : -basis) * closeQty * mult;
                 addRealizedPnL(pnl);
                 record.realizedPnL += pnl;
                 
@@ -2053,6 +2174,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                 if (isExpire) { addRealizedPnL(pnl); record.realizedPnL += pnl; }
                 if (isLoss) { addRealizedPnL(-pnl); record.realizedPnL -= pnl; }
             }
+            syncAverageCostFromLots();
         } else if (pos.qty === 0) {
             pos.qty = isBuy ? qty : -qty;
             pos.avgCost = price;
@@ -2065,7 +2187,10 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
         } else {
             isRealizing = true; 
             const closeQty = Math.min(qty, Math.abs(pos.qty));
-            const pnl = (isBuy ? (pos.avgCost - price) : (price - pos.avgCost)) * closeQty * mult;
+            const basis = usedLinkedLot && consumedLots.length > 0
+                ? getConsumedAverageCost(consumedLots)
+                : pos.avgCost;
+            const pnl = (isBuy ? (basis - price) : (price - basis)) * closeQty * mult;
             addRealizedPnL(pnl);
             record.realizedPnL = pnl;
             
@@ -2076,6 +2201,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                 pos.qty = isBuy ? remainingQty : -remainingQty;
                 pos.avgCost = price;
             }
+            syncAverageCostFromLots();
         }
         
         record.isRealizing = isRealizing; 
@@ -2099,7 +2225,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
         const lot = stockData.lots[assetName];
         if (lot.queue.length > 0) {
             const first = lot.queue[0];
-            const isOpt = first.assetClass === 'Option' || /Call|Put/i.test(assetName) || first.multiplier > 1;
+            const isOpt = isOptionTrade(first);
             if (isOpt) {
                 const totalOpen = lot.queue.reduce((sum, r) => sum + r.openQty, 0);
                 if (totalOpen > 0) {
@@ -2221,6 +2347,12 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
       await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'records', recordId));
       showToast(t("記錄已刪除"));
     });
+  };
+
+  const handleOpenTradeClick = (trade) => {
+    if (Number(trade.openQty) > 0) {
+      setSelectedTradeForClose(trade);
+    }
   };
 
   return (
@@ -2412,7 +2544,16 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                  .filter(trade => selectedMonthForDetail ? ((trade.date || "").startsWith(selectedMonthForDetail)) : true)
                  .filter(trade => showOnlyRealized ? trade.isRealizing : true)
                  .map(trade => (
-                 <div key={trade.id} className="bg-slate-900 border border-slate-700 rounded-xl p-4 group relative">
+                <div
+                  key={trade.id}
+                  onClick={() => handleOpenTradeClick(trade)}
+                  title={Number(trade.openQty) > 0 ? t("點擊以平倉") : undefined}
+                  className={`bg-slate-900 border border-slate-700 rounded-xl p-4 group relative ${
+                    Number(trade.openQty) > 0
+                      ? 'cursor-pointer hover:border-emerald-500/60 transition-colors'
+                      : ''
+                  }`}
+                >
                    <div className="flex justify-between items-start mb-2 border-b border-slate-800 pb-2 pr-6">
                      <div className="flex items-center gap-2 flex-wrap">
                        <span className={`px-2 py-0.5 rounded text-xs font-bold ${
@@ -2445,7 +2586,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                      </div>
                    </div>
                    
-                   <button onClick={() => handleDeleteRecord(trade.id)} className="absolute top-4 right-4 text-slate-500 hover:text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                   <button onClick={(e) => { e.stopPropagation(); handleDeleteRecord(trade.id); }} className="absolute top-4 right-4 text-slate-500 hover:text-rose-400 opacity-0 group-hover:opacity-100 transition-opacity">
                      <Trash2 size={16} />
                    </button>
 
@@ -2475,6 +2616,18 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
           </div>
         )}
       </Modal>
+
+      <CloseTradeModal
+        isOpen={!!selectedTradeForClose}
+        trade={selectedTradeForClose}
+        db={db}
+        user={user}
+        appId={appId}
+        showToast={showToast}
+        confirmAction={confirmAction}
+        t={t}
+        onClose={() => setSelectedTradeForClose(null)}
+      />
 
       <Modal 
         isOpen={!!selectedStockForSchedule} 
@@ -2569,6 +2722,318 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
         </div>
       </Modal>
     </div>
+  );
+};
+
+const CloseTradeModal = ({
+  isOpen,
+  onClose,
+  trade,
+  db,
+  user,
+  appId,
+  showToast,
+  confirmAction,
+  t
+}) => {
+  const [lifecycle, setLifecycle] = useState('close');
+  const [closeQty, setCloseQty] = useState('');
+  const [closePrice, setClosePrice] = useState('');
+  const [strikePrice, setStrikePrice] = useState('');
+  const [date, setDate] = useState(getLocalDateInputValue());
+  const [isSaving, setIsSaving] = useState(false);
+
+  const isOption = isOptionTrade(trade);
+  const optionDetails = useMemo(
+    () => parseOptionDetails(trade?.assetName),
+    [trade?.assetName]
+  );
+  const openQty = Number(trade?.openQty || 0);
+  const multiplier = Number(trade?.multiplier || 1);
+  const originalAction = String(trade?.action || '').toUpperCase();
+  const isLong = originalAction === 'BUY';
+  const reverseAction = isLong ? 'Sell' : 'Buy';
+  const lifecycleAction = isLong ? 'Loss' : 'Expire';
+  const stockQuantity = openQty * multiplier;
+  const underlyingAction = optionDetails.optionType === 'call'
+    ? (isLong ? 'Buy' : 'Sell')
+    : (isLong ? 'Sell' : 'Buy');
+
+  useEffect(() => {
+    if (!isOpen || !trade) return;
+
+    setLifecycle('close');
+    setCloseQty(String(Number(trade.qty) || openQty));
+    setClosePrice('');
+    setStrikePrice(optionDetails.strike === null ? '' : String(optionDetails.strike));
+    setDate(getLocalDateInputValue());
+    setIsSaving(false);
+  }, [isOpen, trade?.id, trade?.assetName, trade?.qty, openQty, optionDetails.strike]);
+
+  const formatAmount = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number)
+      ? number.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })
+      : '-';
+  };
+
+  const actionLabel = (action) => action === 'Buy' ? t("買入") : t("賣出");
+
+  const handleSubmit = () => {
+    if (!trade || openQty <= 0) {
+      showToast(t("找不到有效的未平倉數量"), "error");
+      return;
+    }
+
+    if (!date || Number.isNaN(new Date(`${date}T00:00:00`).getTime())) {
+      showToast(t("請輸入有效的日期"), "error");
+      return;
+    }
+
+    const enteredClosePrice = Number(closePrice);
+    const enteredCloseQty = Number(closeQty);
+    if (lifecycle === 'close') {
+      if (!Number.isFinite(enteredCloseQty) || enteredCloseQty <= 0) {
+        showToast(t("請輸入有效的數量"), "error");
+        return;
+      }
+      if (enteredCloseQty > openQty) {
+        showToast(t("平倉數量不可超過未平倉數量"), "error");
+        return;
+      }
+      if (!Number.isFinite(enteredClosePrice) || enteredClosePrice <= 0) {
+        showToast(t("請輸入有效的價格"), "error");
+        return;
+      }
+    }
+
+    const originalPremium = Number(trade.price);
+    if (lifecycle !== 'close' && (!Number.isFinite(originalPremium) || originalPremium < 0)) {
+      showToast(t("請輸入有效的價格"), "error");
+      return;
+    }
+
+    const strike = optionDetails.strike ?? Number(strikePrice);
+    if (lifecycle === 'execute') {
+      if (!optionDetails.optionType) {
+        showToast(t("Option 名稱缺少 Call/Put"), "error");
+        return;
+      }
+      if (!Number.isFinite(strike) || strike <= 0) {
+        showToast(t("無法解析履約價，請輸入履約價"), "error");
+        return;
+      }
+    }
+
+    const optionQuantity = lifecycle === 'close' ? enteredCloseQty : openQty;
+    const actionText = lifecycle === 'close'
+      ? `${actionLabel(reverseAction)} ${trade.assetName}`
+      : lifecycle === 'expire'
+        ? `${isLong ? t("到期虧損") : t("到期獲利")} ${trade.assetName}`
+        : `${t("執行")} ${trade.assetName}`;
+    const detailsText = lifecycle === 'close'
+      ? `${actionText}, ${t("數量")} ${optionQuantity}, ${t("價格")} $${formatAmount(enteredClosePrice)}, ${t("日期")} ${date}`
+      : lifecycle === 'expire'
+        ? `${actionText}, ${t("數量")} ${optionQuantity}, ${t("原始 premium")} $${formatAmount(originalPremium)}, ${t("日期")} ${date}`
+        : `${actionText}, ${t("原始 premium")} $${formatAmount(originalPremium)}, ${underlyingAction === 'Buy' ? t("買入") : t("賣出")} ${stockQuantity} ${trade.symbol} @ $${formatAmount(strike)}, ${t("日期")} ${date}`;
+
+    confirmAction(t("確認交易"), `${t("將新增交易")}: ${detailsText}`, async () => {
+      setIsSaving(true);
+      try {
+        const batch = writeBatch(db);
+        const createdAt = Date.now();
+
+        const addGeneratedRecord = (data) => {
+          const ref = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'records'));
+          batch.set(ref, {
+            id: ref.id,
+            createdAt,
+            sourceTradeId: trade.id,
+            ...data
+          });
+        };
+
+        if (lifecycle === 'close') {
+          addGeneratedRecord({
+            symbol: trade.symbol,
+            assetClass: isOption ? 'Option' : 'Stock',
+            assetName: trade.assetName,
+            action: reverseAction,
+            qty: optionQuantity,
+            price: enteredClosePrice,
+            multiplier: multiplier,
+            date,
+            lifecycleAction: 'close',
+            rawText: `Close ${reverseAction} ${trade.assetName} ${optionQuantity}@${enteredClosePrice} ${date}`
+          });
+        } else {
+          addGeneratedRecord({
+            symbol: trade.symbol,
+            assetClass: 'Option',
+            assetName: trade.assetName,
+            action: lifecycleAction,
+            qty: optionQuantity,
+            price: originalPremium,
+            multiplier,
+            date,
+            lifecycleAction: lifecycle,
+            rawText: `${lifecycle === 'execute' ? 'Execute' : 'Expire'} ${trade.assetName} ${optionQuantity}@${originalPremium} ${date}`
+          });
+
+          if (lifecycle === 'execute') {
+            addGeneratedRecord({
+              symbol: trade.symbol,
+              assetClass: 'Stock',
+              assetName: trade.symbol,
+              action: underlyingAction,
+              qty: stockQuantity,
+              price: strike,
+              multiplier: 1,
+              date,
+              lifecycleAction: 'execute-underlying',
+              rawText: `Execute ${trade.assetName}: ${underlyingAction} ${trade.symbol} ${stockQuantity}@${strike} ${date}`
+            });
+          }
+        }
+
+        await batch.commit();
+        showToast(t("交易已儲存！"));
+        onClose();
+      } catch (error) {
+        console.error(error);
+        showToast(t("匯入失敗，發生未知的錯誤。"), "error");
+      } finally {
+        setIsSaving(false);
+      }
+    });
+  };
+
+  if (!isOpen || !trade) return null;
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      title={<div className="flex items-center gap-2"><Activity size={20} className="text-emerald-400" /> {t("平倉交易")}</div>}
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={isSaving}>{t("取消")}</Button>
+          <Button variant="primary" onClick={handleSubmit} disabled={isSaving || openQty <= 0}>
+            {isSaving ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
+            {t("確認執行")}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <div className="bg-slate-900/70 border border-slate-700 rounded-xl p-4 space-y-2">
+          <div className="text-white font-mono text-sm break-all">{trade.assetName}</div>
+          <div className="grid grid-cols-2 gap-2 text-sm">
+            <div className="text-slate-400">{t("原交易數量")}: <span className="text-white font-mono">{trade.qty}</span></div>
+            <div className="text-slate-400">{t("目前未平倉數量")}: <span className="text-emerald-400 font-mono">{openQty}</span></div>
+            <div className="text-slate-400">{t("原始動作")}: <span className="text-white">{actionLabel(originalAction === 'BUY' ? 'Buy' : 'Sell')}</span></div>
+          </div>
+        </div>
+
+        {isOption && (
+          <div>
+            <label className="block text-sm font-medium text-slate-400 mb-1">{t("平倉動作")}</label>
+            <select
+              value={lifecycle}
+              onChange={(event) => setLifecycle(event.target.value)}
+              className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white outline-none focus:border-blue-500"
+            >
+              <option value="close">{t("平倉")} ({actionLabel(reverseAction)})</option>
+              <option value="expire">{t("到期")}</option>
+              <option value="execute">{t("執行")}</option>
+            </select>
+          </div>
+        )}
+
+        {!isOption && (
+          <div className="bg-blue-900/20 border border-blue-800/50 rounded-lg p-3 text-sm text-blue-200">
+            {t("平倉動作")}: <span className="font-bold">{actionLabel(reverseAction)}</span>
+          </div>
+        )}
+
+        {lifecycle === 'close' ? (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-400 mb-1">{t("數量")}</label>
+              <input
+                type="number"
+                min="0"
+                max={openQty}
+                step="any"
+                value={closeQty}
+                onChange={(event) => setCloseQty(event.target.value)}
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono outline-none focus:border-blue-500"
+                placeholder="0"
+                autoFocus
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-400 mb-1">{t("成交價（每股／每份）")}</label>
+              <input
+                type="number"
+                min="0"
+                step="any"
+                value={closePrice}
+                onChange={(event) => setClosePrice(event.target.value)}
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono outline-none focus:border-blue-500"
+                placeholder="0.00"
+              />
+            </div>
+          </div>
+        ) : (
+          <div className="bg-purple-900/20 border border-purple-800/50 rounded-lg p-3 text-sm text-purple-200">
+            {t("原始 premium")}: <span className="font-mono">${formatAmount(trade.price)}</span>
+            <span className="ml-2">({isLong ? t("到期虧損") : t("到期獲利")})</span>
+          </div>
+        )}
+
+        {isOption && lifecycle === 'execute' && (
+          <div className="space-y-3">
+            {!optionDetails.optionType && (
+              <div className="bg-rose-900/20 border border-rose-800/50 rounded-lg p-3 text-sm text-rose-200">
+                {t("Option 名稱缺少 Call/Put")}
+              </div>
+            )}
+            {optionDetails.strike === null ? (
+              <div>
+                <label className="block text-sm font-medium text-slate-400 mb-1">{t("履約價")}</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  value={strikePrice}
+                  onChange={(event) => setStrikePrice(event.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono outline-none focus:border-blue-500"
+                  placeholder="0.00"
+                />
+              </div>
+            ) : (
+              <div className="bg-amber-900/20 border border-amber-800/50 rounded-lg p-3 text-sm text-amber-200">
+                {t("履約價")}: <span className="font-mono">${formatAmount(optionDetails.strike)}</span>
+              </div>
+            )}
+            <div className="bg-slate-900/70 border border-slate-700 rounded-lg p-3 text-sm text-slate-300">
+              {actionLabel(underlyingAction)} {stockQuantity} {trade.symbol} @ ${formatAmount(strikePrice || optionDetails.strike)}
+            </div>
+          </div>
+        )}
+
+        <div>
+          <label className="block text-sm font-medium text-slate-400 mb-1">{t("日期")}</label>
+          <input
+            type="date"
+            value={date}
+            onChange={(event) => setDate(event.target.value)}
+            className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-white font-mono outline-none focus:border-blue-500"
+          />
+        </div>
+      </div>
+    </Modal>
   );
 };
 
@@ -2798,6 +3263,11 @@ const AddRecordModal = ({ isOpen, onClose, stocks, db, user, appId, showToast, t
 
 export default function App() {
   const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authMessage, setAuthMessage] = useState('');
   const [activeTab, setActiveTab] = useState('dashboard');
   const [lang, setLang] = useState('zh');
   
@@ -2857,22 +3327,54 @@ export default function App() {
     }
   };
 
-  // Single-user local deployment: wait for the backend to answer, then run as
-  // the fixed local identity instead of signing in.
   useEffect(() => {
     let cancelled = false;
+
+    if (isCloudAuthEnabled) {
+      const unsubscribe = onSessionChange((session) => {
+        if (!cancelled) {
+          setUser(sessionUser(session));
+          setAuthReady(true);
+        }
+      });
+      getCurrentSession()
+        .then((session) => {
+          if (!cancelled) {
+            setUser(sessionUser(session));
+            setAuthReady(true);
+          }
+        })
+        .catch((error) => {
+          console.error(error);
+          if (!cancelled) {
+            setAuthMessage(error.message);
+            setAuthReady(true);
+          }
+        });
+      return () => {
+        cancelled = true;
+        unsubscribe();
+      };
+    }
+
     const waitForBackend = async () => {
       for (let attempt = 0; attempt < 30; attempt++) {
         if (cancelled) return;
         try {
           await api.health();
-          if (!cancelled) setUser(LOCAL_USER);
+          if (!cancelled) {
+            setUser(LOCAL_USER);
+            setAuthReady(true);
+          }
           return;
         } catch (err) {
           await new Promise(r => setTimeout(r, 1000));
         }
       }
-      if (!cancelled) showToast(t("登入失敗，請重新載入"), "error");
+      if (!cancelled) {
+        setAuthReady(true);
+        setAuthMessage(t("登入失敗，請重新載入"));
+      }
     };
     waitForBackend();
     return () => { cancelled = true; };
@@ -3204,28 +3706,72 @@ export default function App() {
     setConfirmModal({ isOpen: true, title, message, onConfirm: () => { onConfirm(); setConfirmModal({ isOpen: false }); } });
   };
 
+  const handleCloudSignIn = async (mode) => {
+    const email = authEmail.trim();
+    if (!email) {
+      setAuthMessage('Email is required');
+      return;
+    }
+    setAuthBusy(true);
+    setAuthMessage('');
+    try {
+      if (mode === 'magic') {
+        await sendMagicLink(email);
+        setAuthMessage('Magic link sent. Please check your email.');
+      } else {
+        await signInWithPassword(email, authPassword);
+      }
+    } catch (error) {
+      setAuthMessage(error.message || 'Sign in failed');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOut();
+    } catch (error) {
+      showToast(error.message || 'Sign out failed', 'error');
+    }
+  };
+
   const handleExport = async () => {
     let performanceSettings = null;
+    let marketDataCache = [];
     if (user) {
       try {
-        // 匯出時，動態抓取使用者的自訂排序設定
         const perfRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'performance');
         const perfSnap = await getDoc(perfRef);
         if (perfSnap.exists()) {
           performanceSettings = perfSnap.data();
         }
+        marketDataCache = await api.listDocs('market_data_cache');
       } catch (err) {
         console.error(err);
       }
     }
 
-    const data = { version: "1.0", exportDate: new Date().toISOString(), stocks, simulations, records, userSettings, performanceSettings };
+    const data = createBackup({
+      stocks,
+      simulations,
+      records,
+      userSettings,
+      performanceSettings,
+      marketDataCache,
+      source: {
+        systemVersion: SYSTEM_VERSION,
+        userId: user?.uid || null,
+        authMode: isCloudAuthEnabled ? 'supabase' : 'local',
+      },
+    });
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = `trade-decision-model-backup-${new Date().toISOString().split('T')[0]}.json`;
     a.click();
+    URL.revokeObjectURL(url);
     showToast(t("資料已成功匯出"));
   };
 
@@ -3236,45 +3782,45 @@ export default function App() {
     reader.onload = async (e) => {
       try {
         const data = JSON.parse(e.target.result);
-        if (!data.stocks && !data.simulations && !data.records) throw new Error("Invalid format");
-        
-        const batch = writeBatch(db);
-        if (data.stocks && Array.isArray(data.stocks)) {
-          data.stocks.forEach(stock => {
-            const ref = doc(db, 'artifacts', appId, 'users', user.uid, 'stocks', stock.id || stock.symbol);
-            batch.set(ref, stock, { merge: true });
-          });
-        }
-        if (data.simulations && Array.isArray(data.simulations)) {
-          data.simulations.forEach(sim => {
-            if (!sim.id) return;
-            const ref = doc(db, 'artifacts', appId, 'users', user.uid, 'simulations', sim.id);
-            batch.set(ref, sim, { merge: true });
-          });
-        }
-        if (data.records && Array.isArray(data.records)) {
-          data.records.forEach(rec => {
-            const ref = doc(db, 'artifacts', appId, 'users', user.uid, 'records', rec.id || crypto.randomUUID());
-            batch.set(ref, rec, { merge: true });
-          });
-        }
-        
-        if (data.userSettings) {
-          const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'api');
-          batch.set(settingsRef, data.userSettings, { merge: true });
-        }
-        
-        // 匯入時，一併還原使用者的自訂排序設定
-        if (data.performanceSettings) {
-          const perfRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'performance');
-          batch.set(perfRef, data.performanceSettings, { merge: true });
-        }
+        let existingPerformanceSettings = null;
+        const perfRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'performance');
+        const perfSnap = await getDoc(perfRef);
+        if (perfSnap.exists()) existingPerformanceSettings = perfSnap.data();
+        const { operations, summary } = parseBackup(data, {
+          existingUserSettings: userSettings,
+          existingPerformanceSettings,
+        });
 
-        await batch.commit();
-        setIsImportModalOpen(false);
-        showToast(t("資料智慧合併匯入成功！"));
+        const applyImport = async () => {
+          try {
+            const batch = writeBatch(db);
+            operations.forEach((operation) => {
+              const ref = doc(db, operation.collection, operation.id);
+              batch.set(ref, operation.data, { merge: true });
+            });
+            await batch.commit();
+            setIsImportModalOpen(false);
+            showToast(`${t("資料智慧合併匯入成功！")} (${summary.total})`);
+          } catch (err) {
+            console.error(err);
+            showToast(t("匯入失敗，發生未知的錯誤。"), "error");
+          }
+        };
+
+        confirmAction(
+          t("確認匯入備份"),
+          `${t("將合併以下資料，不會刪除現有資料")}：`
+            + `${t("股票")} ${summary.stocks}、`
+            + `${t("模擬")} ${summary.simulations}、`
+            + `${t("交易紀錄")} ${summary.records}、`
+            + `${t("行情快取")} ${summary.marketDataCache}`,
+          applyImport,
+        );
       } catch (err) {
+        console.error(err);
         showToast(t("匯入失敗：檔案格式不正確"), "error");
+      } finally {
+        event.target.value = '';
       }
     };
     reader.readAsText(file);
@@ -3289,11 +3835,49 @@ export default function App() {
   };
 
   if (!user) {
+    if (isCloudAuthEnabled && authReady) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white p-6">
+          <div className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-4">
+            <div>
+              <h1 className="text-xl font-bold">{t("交易決策系統")}</h1>
+              <p className="text-sm text-slate-400 mt-1">Sign in with Supabase</p>
+            </div>
+            <input
+              type="email"
+              value={authEmail}
+              onChange={(event) => setAuthEmail(event.target.value)}
+              placeholder="Email"
+              autoComplete="email"
+              className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 focus:outline-none focus:border-blue-500"
+            />
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(event) => setAuthPassword(event.target.value)}
+              onKeyDown={(event) => event.key === 'Enter' && handleCloudSignIn('password')}
+              placeholder="Password"
+              autoComplete="current-password"
+              className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 focus:outline-none focus:border-blue-500"
+            />
+            {authMessage && <p className="text-sm text-amber-300">{authMessage}</p>}
+            <div className="grid grid-cols-2 gap-3">
+              <Button variant="primary" onClick={() => handleCloudSignIn('password')} disabled={authBusy}>
+                {authBusy ? 'Signing in…' : 'Sign in'}
+              </Button>
+              <Button variant="outline" onClick={() => handleCloudSignIn('magic')} disabled={authBusy}>
+                Email magic link
+              </Button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">
         <div className="flex flex-col items-center gap-4">
-          <RefreshCw className="animate-spin text-blue-500" size={40} />
-          <p>{t("系統初始化中...")}</p>
+          {!authReady && <RefreshCw className="animate-spin text-blue-500" size={40} />}
+          <p>{authMessage || t("系統初始化中...")}</p>
         </div>
       </div>
     );
@@ -3345,6 +3929,9 @@ export default function App() {
           <Button variant="ghost" className="w-full justify-start text-sm" icon={Download} onClick={handleExport}>{t("匯出備份 (JSON)")}</Button>
           <Button variant="ghost" className="w-full justify-start text-sm" icon={Upload} onClick={() => setIsImportModalOpen(true)}>{t("匯入還原")}</Button>
           <Button variant="ghost" className="w-full justify-start text-sm" icon={QrCode} onClick={() => setIsQrModalOpen(true)}>{t("網頁 QR Code")}</Button>
+          {isCloudAuthEnabled && (
+            <Button variant="ghost" className="w-full justify-start text-sm" icon={Power} onClick={handleSignOut}>Sign out</Button>
+          )}
           <div className="pt-2 mt-2 border-t border-slate-800">
              <button onClick={handleToggleLang} className="w-full flex items-center justify-between px-4 py-2 text-sm text-slate-400 hover:bg-slate-800 hover:text-slate-200 rounded-lg transition-colors">
                 <div className="flex items-center gap-2"><Globe size={16}/> {t("語言")}</div>
@@ -3367,6 +3954,9 @@ export default function App() {
             <button onClick={handleToggleLang} className="p-1 mr-2 text-slate-400">
                <span className="font-mono text-xs">{lang.toUpperCase()}</span>
             </button>
+            {isCloudAuthEnabled && (
+              <button onClick={handleSignOut} className="p-1 text-slate-400 hover:text-white" aria-label="Sign out"><Power size={18} /></button>
+            )}
             <button onClick={() => setActiveTab('dashboard')} className={`p-2 rounded ${activeTab==='dashboard'?'bg-blue-600':'bg-slate-800'}`}><LayoutDashboard size={18}/></button>
             <button onClick={() => setActiveTab('checklist')} className={`p-2 rounded ${activeTab==='checklist'?'bg-blue-600':'bg-slate-800'}`}><ListTodo size={18}/></button>
             <button onClick={() => setActiveTab('warroom')} className={`p-2 rounded ${activeTab==='warroom'?'bg-blue-600':'bg-slate-800'}`}><Swords size={18}/></button>

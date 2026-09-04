@@ -1,9 +1,18 @@
+import { getAccessToken } from './auth.js';
+
 const BASE = import.meta.env.VITE_API_BASE || '/api';
 
 async function request(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (!headers.has('Content-Type') && options.body != null) {
+    headers.set('Content-Type', 'application/json');
+  }
+  const token = await getAccessToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers,
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => res.statusText);

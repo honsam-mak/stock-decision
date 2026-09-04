@@ -4,12 +4,16 @@ services:
     container_name: sds-backend
     restart: unless-stopped
     environment:
+      STORE_BACKEND: opensearch
       OPENSEARCH_HOST: ${OPENSEARCH_HOST:-http://opensearch:9200}
       OPENSEARCH_USER: ${OPENSEARCH_USER:-}
       OPENSEARCH_PASSWORD: ${OPENSEARCH_PASSWORD:-}
       INDEX_PREFIX: ${INDEX_PREFIX:-sds}
+      AUTH_DISABLED: "true"
+      LOCAL_USER_ID: ${LOCAL_USER_ID:-local}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}
       ALPHA_VANTAGE_KEY: ${ALPHA_VANTAGE_KEY:-}
     ports:
       - "${BACKEND_PORT:-8000}:8000"

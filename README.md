@@ -1,10 +1,12 @@
 # 股票交易決策系統 (Stock Decision System)
 
-將 Gemini Canvas 上的單檔 React 程式 (`stock_decision_system_v0_83.tsx`) 移植到本機，
-以 Docker 執行，資料改存放於本地既有的 OpenSearch。
+將 Gemini Canvas 上的單檔 React 程式 (`stock_decision_system_v0_83.tsx`) 移植為可在兩種環境執行的應用：
+
+- 本機：Docker + OpenSearch，預設不登入。
+- 雲端：GitHub + Vercel + Supabase PostgreSQL，使用 Supabase Auth 單一 owner 登入。
 
 原版依賴 Firebase (Auth + Firestore)、瀏覽器端的公開 CORS proxy，以及由 Canvas 環境注入的
-Gemini 金鑰。本地版把這三者都換掉了，UI 與交易邏輯維持原樣。
+Gemini 金鑰。現在資料層可切換 OpenSearch / PostgreSQL，UI 與交易邏輯維持相同。
 
 ## 功能
 
@@ -26,6 +28,9 @@ Gemini 金鑰。本地版把這三者都換掉了，UI 與交易邏輯維持原�
                                 ├─► Yahoo Finance      伺服器端直抓，免 CORS proxy
                                 └─► Gemini API         金鑰只存後端
 ```
+
+雲端由 Vercel 同網域提供 `frontend/dist` 與 `/api/*` FastAPI Function；FastAPI 驗證
+Supabase access token 後，透過 transaction pooler 存取 PostgreSQL。
 
 ### 與原版的對應關係
 
@@ -101,13 +106,22 @@ curl -s http://localhost:8000/api/health # 健康檢查
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
+| `STORE_BACKEND` | `opensearch` | 本機用 `opensearch`；Vercel 用 `postgres` |
 | `OPENSEARCH_HOST` | `http://opensearch:9200` | 現有容器停用了 security plugin，故為純 HTTP 免帳密 |
 | `OPENSEARCH_USER` / `OPENSEARCH_PASSWORD` | 空 | 若日後啟用 security plugin 才需要 |
 | `INDEX_PREFIX` | `sds` | Index 名稱前綴 |
+| `DATABASE_URL` | 空 | Supabase transaction pooler URL；雲端需設 `sslmode=require` |
+| `AUTH_DISABLED` | `true` | 本機為 `true`；Vercel 必須為 `false` |
+| `SUPABASE_URL` | 空 | Supabase project URL，供後端驗 JWT |
+| `OWNER_USER_ID` / `OWNER_EMAIL` | 空 | 雲端允許登入的唯一 owner，至少設定一項 |
+| `CORS_ORIGINS` | `*` | 逗號分隔的允許來源；同網域部署可設正式站 URL |
 | `GEMINI_API_KEY` | 空 | 留空則 AI 功能停用，其餘功能不受影響。金鑰申請：https://aistudio.google.com/apikey |
 | `GEMINI_MODEL` | `gemini-3.5-flash` | 見下方說明 |
 | `ALPHA_VANTAGE_KEY` | 空 | Yahoo 抓不到時的備援資料源 |
 | `FRONTEND_PORT` / `BACKEND_PORT` | `8080` / `8000` | |
+
+前端雲端 build 另需 `VITE_SUPABASE_URL` 與 `VITE_SUPABASE_ANON_KEY`。它們是 Supabase
+允許公開使用的 client 設定；資料庫密碼、Gemini key 不可使用 `VITE_` 前綴。
 
 Alpha Vantage 金鑰也可以直接在 UI 的「API 金鑰設定」填寫，會存進 OpenSearch 並優先於 `.env`。
 
@@ -164,11 +178,52 @@ pip install -r requirements.txt
 OPENSEARCH_HOST=http://localhost:9200 uvicorn app.main:app --reload
 ```
 
+## 部署到 GitHub、Vercel 與 Supabase
+
+### 1. 建立 Supabase project
+
+1. 在 SQL Editor 執行 `supabase/migrations/20260904120000_create_documents.sql`。
+2. 在 Authentication 建立自己的使用者，並記下使用者 UUID；若使用 magic link，把
+   Vercel Preview 與 Production URL 加到 Authentication 的 redirect URLs。
+3. 在 Database → Connect 複製 **Transaction pooler** 連線字串（port 6543），將密碼填入並加入
+   `?sslmode=require`。不要把此字串放進前端環境變數或 Git。
+
+資料表已啟用 RLS 並撤銷 anon/authenticated 的 Data API 權限；只有持有資料庫連線字串的
+FastAPI 能讀寫，而且每筆資料皆以 JWT 的 user ID 隔離。
+
+### 2. 將 repository 連接 Vercel
+
+把本專案 push 到 GitHub，然後在 Vercel 匯入該 repository。專案根目錄維持 repository root；
+`vercel.json` 會建置 `frontend/dist`，並把 `/api/*` 交給 `api/index.py`。
+
+在 Vercel 的 Preview 與 Production environments 設定：
+
+```dotenv
+STORE_BACKEND=postgres
+DATABASE_URL=postgresql://...pooler.supabase.com:6543/postgres?sslmode=require
+AUTH_DISABLED=false
+SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+SUPABASE_JWT_AUDIENCE=authenticated
+OWNER_USER_ID=YOUR_SUPABASE_USER_UUID
+CORS_ORIGINS=https://YOUR_PROJECT.vercel.app
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-3.5-flash
+ALPHA_VANTAGE_KEY=
+VITE_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+VITE_SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+```
+
+若只使用 `OWNER_EMAIL`，亦可不設 `OWNER_USER_ID`；UUID 較不受 email 變更影響，建議優先使用。
+部署後先開 Preview URL 登入，再檢查 `/api/health`、新增一支股票與 JSON 往返匯入。
+
 ## 測試
 
 ```bash
 bash scripts/smoke-test.sh   # 資料層與行情
 bash scripts/ai-test.sh      # Gemini 代理
+python -m pytest backend/tests
+npm --prefix frontend test
+npm --prefix frontend run build
 ```
 
 `smoke-test.sh` 涵蓋健康檢查、文件讀寫/合併/批次、巢狀模擬文件往返、真實報價與歷史抓取、
@@ -190,7 +245,13 @@ python3 scripts/fix_symbols.py --apply   # 實際修正
 
 ## 備份
 
-UI 側邊欄的「匯出備份 (JSON)」與「匯入還原」沿用原版行為，匯入為智慧合併，不會刪除既有資料。
+UI 側邊欄的「匯出備份 (JSON)」與「匯入還原」使用同一個跨環境格式，匯入為智慧合併，
+不會刪除既有資料。
+
+- 舊版 `1.0` 或未標版本的本機備份可匯入本機及雲端。
+- 新版 `1.1` 保留舊版頂層欄位，並加入 canonical IDs 與行情快取，因此可在更新後的本機與雲端雙向交換。
+- Alpha Vantage key 不會寫進新版備份；匯入舊備份時也不會覆寫現有 key。
+- 缺少 ID 的舊交易會產生內容穩定的 ID，重複匯入不會反覆新增同一筆資料。
 
 ## 已知差異
 
