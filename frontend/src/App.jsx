@@ -2242,15 +2242,18 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
 
     if (openOptions.length === 0) return { options: [], calendarDays: [] };
 
+    // Assign a distinct color per open option so overlapping schedules stay
+    // distinguishable even when several contracts share the same expiry.
     const colorClasses = [
-        'bg-emerald-500', 'bg-blue-500', 'bg-purple-500', 
-        'bg-amber-500', 'bg-rose-500', 'bg-cyan-500'
+        'bg-emerald-500', 'bg-blue-500', 'bg-purple-500',
+        'bg-amber-500', 'bg-rose-500', 'bg-cyan-500',
+        'bg-orange-500', 'bg-fuchsia-500', 'bg-lime-500', 'bg-sky-500'
     ];
-    const uniqueExpiries = Array.from(new Set(openOptions.map(o => o.expiryDate.getTime()))).sort((a,b)=>a-b);
-    openOptions.forEach(o => {
-        const colorIdx = uniqueExpiries.indexOf(o.expiryDate.getTime()) % colorClasses.length;
-        o.color = colorClasses[colorIdx];
-    });
+    openOptions
+      .sort((a, b) => a.expiryDate - b.expiryDate || a.assetName.localeCompare(b.assetName))
+      .forEach((o, idx) => {
+        o.color = colorClasses[idx % colorClasses.length];
+      });
 
     const year = calendarBaseDate.getFullYear();
     const month = calendarBaseDate.getMonth();
@@ -2672,8 +2675,8 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                    </div>
 
                    <div className="flex flex-wrap gap-2 text-xs">
-                     {scheduleData.options.map((o, idx) => (
-                        <div key={idx} className="flex items-center gap-1.5 bg-slate-900 border border-slate-700 px-2 py-1 rounded">
+                     {scheduleData.options.map((o) => (
+                        <div key={o.assetName} className="flex items-center gap-1.5 bg-slate-900 border border-slate-700 px-2 py-1 rounded">
                            <div className={`w-2.5 h-2.5 rounded-full ${o.color}`}></div>
                            <span className="text-slate-300">{o.assetName} ({o.openQty}{t("口")})</span>
                         </div>
