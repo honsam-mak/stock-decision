@@ -1,3 +1,5 @@
+import { enrichOptionRecord } from './optionRecord.js';
+
 const SUPPORTED_VERSIONS = new Set([undefined, null, '', '1.0', '1.1']);
 const COLLECTIONS = ['stocks', 'simulations', 'records', 'marketDataCache'];
 
@@ -46,7 +48,7 @@ function canonicalId(canonicalIds, collection, item, fallback) {
   return normalizeText(values[ownId] || values[symbol] || fallback);
 }
 
-function normalizeItem(collection, value, index, canonicalIds) {
+function normalizeItem(collection, value, index, canonicalIds, duplicateOrdinal = 1) {
   assertPlainObject(value, `${collection}[${index}]`);
   const item = { ...value };
   if ('symbol' in item) item.symbol = normalizeSymbol(item.symbol);
@@ -62,20 +64,28 @@ function normalizeItem(collection, value, index, canonicalIds) {
   const naturalId = collection === 'stocks' || collection === 'marketDataCache'
     ? item.symbol
     : '';
-  const fallback = normalizeText(item.id) || naturalId || deterministicId(prefix, item);
+  const generatedId = deterministicId(prefix, item);
+  const uniqueGeneratedId = duplicateOrdinal > 1 ? `${generatedId}-${duplicateOrdinal}` : generatedId;
+  const fallback = normalizeText(item.id) || naturalId || uniqueGeneratedId;
   item.id = canonicalId(canonicalIds, collection, item, fallback) || fallback;
 
   if (collection === 'records' && item.sourceTradeId != null) {
     item.sourceTradeId = normalizeText(item.sourceTradeId);
   }
-  return item;
+  return collection === 'records' ? enrichOptionRecord(item) : item;
 }
 
 function validateCollection(root, name) {
   const value = root[name];
   if (value == null) return [];
   if (!Array.isArray(value)) throw new Error(`${name} must be an array`);
-  return value.map((item, index) => normalizeItem(name, item, index, root.canonicalIds));
+  const duplicateCounts = new Map();
+  return value.map((item, index) => {
+    const identity = JSON.stringify(stableValue(item));
+    const duplicateOrdinal = (duplicateCounts.get(identity) || 0) + 1;
+    duplicateCounts.set(identity, duplicateOrdinal);
+    return normalizeItem(name, item, index, root.canonicalIds, duplicateOrdinal);
+  });
 }
 
 function settingsOperation(id, data, existing, preserveExisting) {

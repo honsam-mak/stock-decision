@@ -13,6 +13,18 @@ import {
   signOut,
 } from './lib/auth.js';
 import { createBackup, parseBackup } from './lib/backup.js';
+import {
+  enrichOptionRecord,
+  isOptionTrade,
+  optionExpiryDate,
+  resolveOptionMeta,
+} from './lib/optionRecord.js';
+import {
+  calcBreakeven,
+  calcExpiryPnL,
+  classifyMoneyness,
+  getExerciseImpact,
+} from './lib/payoff.js';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, LabelList, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
 import { 
   TrendingUp, TrendingDown, LayoutDashboard, ListTodo, Database, 
@@ -146,6 +158,18 @@ const TRANSLATIONS = {
     "無法解析履約價，請輸入履約價": "Strike price could not be parsed; please enter it.",
     "點擊以平倉": "Click to close this trade",
     "到期／執行日期": "Expiration/Execution Date",
+    "標的": "Underlying",
+    "類型": "Type",
+    "到期日": "Expiry",
+    "標的現價": "Underlying Price",
+    "損益兩平": "Breakeven",
+    "到期情境分析": "Expiry Scenario Analysis",
+    "假設到期標的價格": "Assumed Underlying Price at Expiry",
+    "預估到期損益": "Estimated Expiry PnL",
+    "履約預覽": "Exercise Preview",
+    "資金變動": "Cash Impact",
+    "目前沒有可靠的標的報價；價內外判斷暫停，您仍可手動輸入情境價格。": "No reliable underlying quote is available. Moneyness is paused, but you can enter a scenario price manually.",
+    "合約資料不完整，無法計算到期損益。": "Contract metadata is incomplete, so expiry PnL cannot be calculated.",
 
     // AI Features & Chat
     "✨ AI 洞察": "✨ AI Insights",
@@ -317,43 +341,6 @@ const hashString = (str) => {
 const seededRandom = (seed) => {
   const x = Math.sin(seed++) * 10000;
   return x - Math.floor(x);
-};
-
-const parseExpiryDate = (assetName) => {
-    const monthMap = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
-    const match1 = assetName.match(/(?:^|\s)(\d{1,2})\s+([A-Za-z]{3})(\d{2,4})(?:\s|$)/i);
-    if (match1) {
-        const day = parseInt(match1[1]);
-        const month = monthMap[match1[2].toLowerCase()];
-        let year = parseInt(match1[3]);
-        if (year < 100) year += 2000;
-        if (month !== undefined) return new Date(year, month, day);
-    }
-    const match2 = assetName.match(/(?:^|\s)(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:\s|$)/);
-    if (match2) {
-        return new Date(parseInt(match2[1]), parseInt(match2[2]) - 1, parseInt(match2[3]));
-    }
-    return new Date(2099, 11, 31); 
-};
-
-const isOptionTrade = (trade) => {
-    const assetName = String(trade?.assetName || '');
-    return String(trade?.assetClass || '').toLowerCase() === 'option'
-        || /Call|Put/i.test(assetName)
-        || Number(trade?.multiplier || 1) > 1;
-};
-
-const parseOptionDetails = (assetName) => {
-    const name = String(assetName || '');
-    const typeMatch = name.match(/\b(Call|Put)\b/i);
-    const optionType = typeMatch ? typeMatch[1].toLowerCase() : null;
-    const strikeMatch = name.match(/\$?(\d+(?:\.\d+)?)\s*(?=Call|Put\b)/i);
-    const strike = strikeMatch ? Number(strikeMatch[1]) : null;
-
-    return {
-        optionType,
-        strike: Number.isFinite(strike) ? strike : null
-    };
 };
 
 const getLocalDateInputValue = (date = new Date()) => {
@@ -1975,7 +1962,7 @@ const WarRoom = ({ simulations, stocks, marketData, db, user, confirmAction, sho
   );
 };
 
-const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, lang }) => {
+const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmAction, t, lang }) => {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [selectedStockForDetail, setSelectedStockForDetail] = useState(null);
   const [selectedMonthForDetail, setSelectedMonthForDetail] = useState(null); 
@@ -2229,11 +2216,25 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
             if (isOpt) {
                 const totalOpen = lot.queue.reduce((sum, r) => sum + r.openQty, 0);
                 if (totalOpen > 0) {
+                    const meta = resolveOptionMeta(first);
+                    const premium = lot.queue.reduce(
+                      (sum, record) => sum + Number(record.price || 0) * Number(record.openQty || 0),
+                      0
+                    ) / totalOpen;
+                    const currentPrice = Number(liveQuotes?.[meta.underlying]?.price);
                     openOptions.push({
                         assetName,
                         openQty: totalOpen,
                         direction: lot.direction === 1 ? 'Long' : 'Short',
-                        expiryDate: parseExpiryDate(assetName)
+                        expiryDate: optionExpiryDate(first),
+                        meta,
+                        premium,
+                        currentPrice: Number.isFinite(currentPrice) ? currentPrice : null,
+                        breakeven: calcBreakeven({ ...meta, premium }),
+                        moneyness: classifyMoneyness({
+                          ...meta,
+                          underlyingPrice: Number.isFinite(currentPrice) ? currentPrice : null,
+                        }),
                     });
                 }
             }
@@ -2303,7 +2304,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
     }
 
     return { options: openOptions, calendarDays };
-  }, [selectedStockForSchedule, pnlByStock, calendarBaseDate]);
+  }, [selectedStockForSchedule, pnlByStock, calendarBaseDate, liveQuotes]);
 
   // 修改 stockSymbolsWithRecords 以支援自訂排序
   const stockSymbolsWithRecords = useMemo(() => {
@@ -2629,6 +2630,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
         showToast={showToast}
         confirmAction={confirmAction}
         t={t}
+        currentQuote={liveQuotes?.[resolveOptionMeta(selectedTradeForClose || {}).underlying]}
         onClose={() => setSelectedTradeForClose(null)}
       />
 
@@ -2674,11 +2676,28 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                       </button>
                    </div>
 
-                   <div className="flex flex-wrap gap-2 text-xs">
+                   <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
                      {scheduleData.options.map((o) => (
-                        <div key={o.assetName} className="flex items-center gap-1.5 bg-slate-900 border border-slate-700 px-2 py-1 rounded">
-                           <div className={`w-2.5 h-2.5 rounded-full ${o.color}`}></div>
-                           <span className="text-slate-300">{o.assetName} ({o.openQty}{t("口")})</span>
+                        <div key={o.assetName} className="bg-slate-900 border border-slate-700 px-3 py-2 rounded-lg space-y-1.5">
+                           <div className="flex items-start gap-1.5">
+                             <div className={`w-2.5 h-2.5 rounded-full mt-0.5 shrink-0 ${o.color}`}></div>
+                             <span className="text-slate-300 break-all">{o.assetName} ({o.openQty}{t("口")})</span>
+                             {o.moneyness && (
+                               <span className={`ml-auto px-1.5 py-0.5 rounded font-bold ${
+                                 o.moneyness === 'ITM'
+                                   ? 'bg-emerald-500/20 text-emerald-300'
+                                   : o.moneyness === 'ATM'
+                                     ? 'bg-amber-500/20 text-amber-300'
+                                     : 'bg-slate-700 text-slate-300'
+                               }`}>{o.moneyness}</span>
+                             )}
+                           </div>
+                           <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-slate-500 pl-4">
+                             <span>{o.direction} {String(o.meta.optionType || '-').toUpperCase()}</span>
+                             <span>{t("到期日")}: {o.meta.expiry || '-'}</span>
+                             <span>{t("標的現價")}: {o.currentPrice == null ? '-' : `$${o.currentPrice.toFixed(2)}`}</span>
+                             <span>{t("損益兩平")}: {o.breakeven == null ? '-' : `$${o.breakeven.toFixed(2)}`}</span>
+                           </div>
                         </div>
                      ))}
                    </div>
@@ -2711,7 +2730,7 @@ const RecordsTab = ({ stocks, records, db, user, showToast, confirmAction, t, la
                                               <div 
                                                 key={oIdx} 
                                                 className={`h-1.5 rounded-sm w-full opacity-80 ${opt.color} ${isExp ? 'h-3 animate-pulse ring-1 ring-white/50' : ''}`}
-                                                title={isExp ? `${opt.assetName} 到期！` : opt.assetName}
+                                                title={`${opt.assetName}${isExp ? ` ${t("到期")}！` : ''}${opt.moneyness ? ` · ${opt.moneyness}` : ''}`}
                                               />
                                           );
                                       })}
@@ -2737,30 +2756,67 @@ const CloseTradeModal = ({
   appId,
   showToast,
   confirmAction,
-  t
+  t,
+  currentQuote,
 }) => {
   const [lifecycle, setLifecycle] = useState('close');
   const [closeQty, setCloseQty] = useState('');
   const [closePrice, setClosePrice] = useState('');
   const [strikePrice, setStrikePrice] = useState('');
+  const [scenarioPrice, setScenarioPrice] = useState('');
   const [date, setDate] = useState(getLocalDateInputValue());
   const [isSaving, setIsSaving] = useState(false);
 
   const isOption = isOptionTrade(trade);
   const optionDetails = useMemo(
-    () => parseOptionDetails(trade?.assetName),
-    [trade?.assetName]
+    () => resolveOptionMeta(trade || {}),
+    [
+      trade?.assetName,
+      trade?.underlying,
+      trade?.optionType,
+      trade?.strike,
+      trade?.expiry,
+      trade?.symbol,
+    ]
   );
   const openQty = Number(trade?.openQty || 0);
   const multiplier = Number(trade?.multiplier || 1);
   const originalAction = String(trade?.action || '').toUpperCase();
   const isLong = originalAction === 'BUY';
+  const direction = isLong ? 'long' : 'short';
   const reverseAction = isLong ? 'Sell' : 'Buy';
   const lifecycleAction = isLong ? 'Loss' : 'Expire';
-  const stockQuantity = openQty * multiplier;
-  const underlyingAction = optionDetails.optionType === 'call'
-    ? (isLong ? 'Buy' : 'Sell')
-    : (isLong ? 'Sell' : 'Buy');
+  const exerciseImpact = getExerciseImpact({
+    ...optionDetails,
+    direction,
+    qty: openQty,
+    multiplier,
+  });
+  const stockQuantity = exerciseImpact?.shares || openQty * multiplier;
+  const underlyingAction = exerciseImpact?.action || (
+    optionDetails.optionType === 'call'
+      ? (isLong ? 'Buy' : 'Sell')
+      : (isLong ? 'Sell' : 'Buy')
+  );
+  const currentUnderlyingPrice = Number(currentQuote?.price);
+  const hasCurrentUnderlyingPrice = Number.isFinite(currentUnderlyingPrice);
+  const breakeven = calcBreakeven({
+    ...optionDetails,
+    premium: Number(trade?.price),
+  });
+  const moneyness = classifyMoneyness({
+    ...optionDetails,
+    underlyingPrice: hasCurrentUnderlyingPrice ? currentUnderlyingPrice : null,
+  });
+  const scenarioUnderlyingPrice = scenarioPrice === '' ? null : Number(scenarioPrice);
+  const scenarioPnL = calcExpiryPnL({
+    ...optionDetails,
+    premium: Number(trade?.price),
+    underlyingPrice: Number.isFinite(scenarioUnderlyingPrice) ? scenarioUnderlyingPrice : null,
+    direction,
+    qty: openQty,
+    multiplier,
+  });
 
   useEffect(() => {
     if (!isOpen || !trade) return;
@@ -2769,9 +2825,14 @@ const CloseTradeModal = ({
     setCloseQty(String(Number(trade.qty) || openQty));
     setClosePrice('');
     setStrikePrice(optionDetails.strike === null ? '' : String(optionDetails.strike));
+    setScenarioPrice(String(
+      hasCurrentUnderlyingPrice
+        ? currentUnderlyingPrice
+        : (breakeven ?? optionDetails.strike ?? '')
+    ));
     setDate(getLocalDateInputValue());
     setIsSaving(false);
-  }, [isOpen, trade?.id, trade?.assetName, trade?.qty, openQty, optionDetails.strike]);
+  }, [isOpen, trade?.id]);
 
   const formatAmount = (value) => {
     const number = Number(value);
@@ -2829,6 +2890,12 @@ const CloseTradeModal = ({
     }
 
     const optionQuantity = lifecycle === 'close' ? enteredCloseQty : openQty;
+    const structuredOptionFields = isOption ? {
+      underlying: optionDetails.underlying,
+      optionType: optionDetails.optionType,
+      strike: Number.isFinite(strike) ? strike : optionDetails.strike,
+      expiry: optionDetails.expiry,
+    } : {};
     const actionText = lifecycle === 'close'
       ? `${actionLabel(reverseAction)} ${trade.assetName}`
       : lifecycle === 'expire'
@@ -2838,7 +2905,7 @@ const CloseTradeModal = ({
       ? `${actionText}, ${t("數量")} ${optionQuantity}, ${t("價格")} $${formatAmount(enteredClosePrice)}, ${t("日期")} ${date}`
       : lifecycle === 'expire'
         ? `${actionText}, ${t("數量")} ${optionQuantity}, ${t("原始 premium")} $${formatAmount(originalPremium)}, ${t("日期")} ${date}`
-        : `${actionText}, ${t("原始 premium")} $${formatAmount(originalPremium)}, ${underlyingAction === 'Buy' ? t("買入") : t("賣出")} ${stockQuantity} ${trade.symbol} @ $${formatAmount(strike)}, ${t("日期")} ${date}`;
+        : `${actionText}, ${t("原始 premium")} $${formatAmount(originalPremium)}, ${underlyingAction === 'Buy' ? t("買入") : t("賣出")} ${stockQuantity} ${optionDetails.underlying || trade.symbol} @ $${formatAmount(strike)}, ${t("日期")} ${date}`;
 
     confirmAction(t("確認交易"), `${t("將新增交易")}: ${detailsText}`, async () => {
       setIsSaving(true);
@@ -2867,6 +2934,7 @@ const CloseTradeModal = ({
             multiplier: multiplier,
             date,
             lifecycleAction: 'close',
+            ...structuredOptionFields,
             rawText: `Close ${reverseAction} ${trade.assetName} ${optionQuantity}@${enteredClosePrice} ${date}`
           });
         } else {
@@ -2880,21 +2948,22 @@ const CloseTradeModal = ({
             multiplier,
             date,
             lifecycleAction: lifecycle,
+            ...structuredOptionFields,
             rawText: `${lifecycle === 'execute' ? 'Execute' : 'Expire'} ${trade.assetName} ${optionQuantity}@${originalPremium} ${date}`
           });
 
           if (lifecycle === 'execute') {
             addGeneratedRecord({
-              symbol: trade.symbol,
+              symbol: optionDetails.underlying || trade.symbol,
               assetClass: 'Stock',
-              assetName: trade.symbol,
+              assetName: optionDetails.underlying || trade.symbol,
               action: underlyingAction,
               qty: stockQuantity,
               price: strike,
               multiplier: 1,
               date,
               lifecycleAction: 'execute-underlying',
-              rawText: `Execute ${trade.assetName}: ${underlyingAction} ${trade.symbol} ${stockQuantity}@${strike} ${date}`
+              rawText: `Execute ${trade.assetName}: ${underlyingAction} ${optionDetails.underlying || trade.symbol} ${stockQuantity}@${strike} ${date}`
             });
           }
         }
@@ -2937,6 +3006,71 @@ const CloseTradeModal = ({
             <div className="text-slate-400">{t("原始動作")}: <span className="text-white">{actionLabel(originalAction === 'BUY' ? 'Buy' : 'Sell')}</span></div>
           </div>
         </div>
+
+        {isOption && (
+          <div className="bg-slate-950 border border-blue-900/70 rounded-xl p-4 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-bold text-blue-300">{t("到期情境分析")}</div>
+              {moneyness && (
+                <span className={`px-2 py-0.5 rounded text-xs font-bold ${
+                  moneyness === 'ITM'
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : moneyness === 'ATM'
+                      ? 'bg-amber-500/20 text-amber-300'
+                      : 'bg-slate-700 text-slate-300'
+                }`}>
+                  {moneyness}
+                </span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <div className="text-slate-400">{t("標的")}: <span className="text-white font-mono">{optionDetails.underlying || '-'}</span></div>
+              <div className="text-slate-400">{t("類型")}: <span className="text-white font-mono uppercase">{optionDetails.optionType || '-'}</span></div>
+              <div className="text-slate-400">{t("履約價")}: <span className="text-white font-mono">{optionDetails.strike == null ? '-' : `$${formatAmount(optionDetails.strike)}`}</span></div>
+              <div className="text-slate-400">{t("到期日")}: <span className="text-white font-mono">{optionDetails.expiry || '-'}</span></div>
+              <div className="text-slate-400">{t("標的現價")}: <span className="text-white font-mono">{hasCurrentUnderlyingPrice ? `$${formatAmount(currentUnderlyingPrice)}` : '-'}</span></div>
+              <div className="text-slate-400">{t("損益兩平")}: <span className="text-white font-mono">{breakeven == null ? '-' : `$${formatAmount(breakeven)}`}</span></div>
+            </div>
+
+            {!hasCurrentUnderlyingPrice && (
+              <div className="text-xs text-amber-300 bg-amber-900/20 border border-amber-800/50 rounded-lg p-2">
+                {t("目前沒有可靠的標的報價；價內外判斷暫停，您仍可手動輸入情境價格。")}
+              </div>
+            )}
+
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1">{t("假設到期標的價格")}</label>
+              <input
+                type="number"
+                min="0"
+                step="any"
+                value={scenarioPrice}
+                onChange={(event) => setScenarioPrice(event.target.value)}
+                className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-white font-mono outline-none focus:border-blue-500"
+                placeholder="0.00"
+              />
+            </div>
+
+            {scenarioPnL === null ? (
+              <div className="text-xs text-rose-300">{t("合約資料不完整，無法計算到期損益。")}</div>
+            ) : (
+              <div className="flex justify-between items-center bg-slate-900 rounded-lg p-3">
+                <span className="text-sm text-slate-300">{t("預估到期損益")}</span>
+                <span className={`font-mono font-bold ${scenarioPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                  {scenarioPnL >= 0 ? '+' : '-'}${formatAmount(Math.abs(scenarioPnL))}
+                </span>
+              </div>
+            )}
+
+            {exerciseImpact && (
+              <div className="text-xs text-slate-400">
+                {t("履約預覽")}: {actionLabel(exerciseImpact.action)} {exerciseImpact.shares} {optionDetails.underlying || trade.symbol}
+                {' @ '}${formatAmount(optionDetails.strike)}；{t("資金變動")} {exerciseImpact.cashFlow >= 0 ? '+' : '-'}${formatAmount(Math.abs(exerciseImpact.cashFlow))}
+              </div>
+            )}
+          </div>
+        )}
 
         {isOption && (
           <div>
@@ -3021,7 +3155,7 @@ const CloseTradeModal = ({
               </div>
             )}
             <div className="bg-slate-900/70 border border-slate-700 rounded-lg p-3 text-sm text-slate-300">
-              {actionLabel(underlyingAction)} {stockQuantity} {trade.symbol} @ ${formatAmount(strikePrice || optionDetails.strike)}
+              {actionLabel(underlyingAction)} {stockQuantity} {optionDetails.underlying || trade.symbol} @ ${formatAmount(strikePrice || optionDetails.strike)}
             </div>
           </div>
         )}
@@ -3084,6 +3218,7 @@ const AddRecordModal = ({ isOpen, onClose, stocks, db, user, appId, showToast, t
 
     IMPORTANT: 
     - "assetName" should include strike and expiration for options (e.g., "ONDS 24 Apr26 9.5 Call").
+    - For every Option object, also return: underlying (ticker), optionType ("call" or "put"), strike (number), and expiry ("YYYY-MM-DD").
     - For the Stock transaction resulting from an option execution, the "qty" MUST be the option qty multiplied by its multiplier (e.g., 3 options * 100 = 300 stock qty).
 
     Return ONLY a valid JSON array matching this exact schema (do not include markdown \`\`\`json wrappers):
@@ -3095,7 +3230,11 @@ const AddRecordModal = ({ isOpen, onClose, stocks, db, user, appId, showToast, t
         "qty": number (positive integer),
         "price": number,
         "multiplier": number (1 for stock, typically 100 for options),
-        "date": "YYYY-MM-DD"
+        "date": "YYYY-MM-DD",
+        "underlying": "ticker for Option, otherwise omit",
+        "optionType": "call or put for Option, otherwise omit",
+        "strike": number for Option, otherwise omit,
+        "expiry": "YYYY-MM-DD for Option, otherwise omit"
       }
     ]
     If the year is missing, assume the current logical year (e.g. 2026).`;
@@ -3108,7 +3247,10 @@ const AddRecordModal = ({ isOpen, onClose, stocks, db, user, appId, showToast, t
          const cleanJson = result.replace(/```json/g, '').replace(/```/g, '').trim();
          const data = JSON.parse(cleanJson);
          const dataArray = Array.isArray(data) ? data : [data];
-         setParsedDataList(dataArray.map(item => ({ ...item, id: crypto.randomUUID() })));
+         setParsedDataList(dataArray.map(item => ({
+           ...enrichOptionRecord({ ...item, symbol: selectedSymbol }),
+           id: crypto.randomUUID(),
+         })));
          showToast(t("指令轉換成功"));
        } catch (err) {
          showToast(t("AI 轉換失敗，請重新嘗試。"), "error");
@@ -3131,17 +3273,22 @@ const AddRecordModal = ({ isOpen, onClose, stocks, db, user, appId, showToast, t
     try {
        const batch = writeBatch(db);
        parsedDataList.forEach(data => {
+           const normalizedData = enrichOptionRecord({ ...data, symbol: selectedSymbol });
            const ref = doc(collection(db, 'artifacts', appId, 'users', user.uid, 'records'));
            batch.set(ref, {
              id: ref.id,
              symbol: selectedSymbol,
-             assetClass: data.assetClass,
-             assetName: data.assetName,
-             action: data.action,
-             qty: data.qty,
-             price: data.price,
-             multiplier: data.multiplier,
-             date: data.date,
+             assetClass: normalizedData.assetClass,
+             assetName: normalizedData.assetName,
+             action: normalizedData.action,
+             qty: normalizedData.qty,
+             price: normalizedData.price,
+             multiplier: normalizedData.multiplier,
+             date: normalizedData.date,
+             ...(normalizedData.underlying ? { underlying: normalizedData.underlying } : {}),
+             ...(normalizedData.optionType ? { optionType: normalizedData.optionType } : {}),
+             ...(Number.isFinite(Number(normalizedData.strike)) ? { strike: Number(normalizedData.strike) } : {}),
+             ...(normalizedData.expiry ? { expiry: normalizedData.expiry } : {}),
              rawText: rawText,
              createdAt: Date.now()
            });
@@ -3228,8 +3375,32 @@ const AddRecordModal = ({ isOpen, onClose, stocks, db, user, appId, showToast, t
                           </div>
                           <div className="col-span-2">
                             <label className="block text-[11px] text-slate-500 uppercase">{t("資產名稱")}</label>
-                            <input type="text" value={parsedData.assetName} onChange={e => handleAddRecordChange(parsedData.id, 'assetName', e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white font-mono" />
+                            <input type="text" value={parsedData.assetName || ''} onChange={e => handleAddRecordChange(parsedData.id, 'assetName', e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white font-mono" />
                           </div>
+                          {String(parsedData.assetClass).toLowerCase() === 'option' && (
+                            <>
+                              <div>
+                                <label className="block text-[11px] text-slate-500 uppercase">{t("標的")}</label>
+                                <input type="text" value={parsedData.underlying || selectedSymbol} onChange={e => handleAddRecordChange(parsedData.id, 'underlying', e.target.value.toUpperCase())} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white font-mono uppercase" />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-slate-500 uppercase">{t("類型")}</label>
+                                <select value={parsedData.optionType || ''} onChange={e => handleAddRecordChange(parsedData.id, 'optionType', e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white">
+                                  <option value="">-</option>
+                                  <option value="call">Call</option>
+                                  <option value="put">Put</option>
+                                </select>
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-slate-500 uppercase">{t("履約價")}</label>
+                                <input type="number" min="0" step="any" value={parsedData.strike ?? ''} onChange={e => handleAddRecordChange(parsedData.id, 'strike', e.target.value === '' ? '' : Number(e.target.value))} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white font-mono" />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-slate-500 uppercase">{t("到期日")}</label>
+                                <input type="date" value={parsedData.expiry || ''} onChange={e => handleAddRecordChange(parsedData.id, 'expiry', e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white font-mono" />
+                              </div>
+                            </>
+                          )}
                           <div>
                             <label className="block text-[11px] text-slate-500 uppercase">{t("數量")}</label>
                             <input type="number" value={parsedData.qty} onChange={e => handleAddRecordChange(parsedData.id, 'qty', Number(e.target.value))} className="w-full bg-slate-950 border border-slate-800 rounded p-2 text-sm text-white font-mono" />
@@ -3971,7 +4142,7 @@ export default function App() {
           {activeTab === 'dashboard' && <Dashboard stocks={stocks} marketData={marketData} liveQuotes={liveQuotes} loadingQuotes={loadingQuotes} db={db} user={user} confirmAction={confirmAction} forceFetchStock={forceFetchStock} handleManualImportHTML={handleManualImportHTML} showToast={showToast} t={t} lang={lang} />}
           {activeTab === 'checklist' && <Checklist stocks={stocks} db={db} user={user} showToast={showToast} t={t} lang={lang} />}
           {activeTab === 'warroom' && <WarRoom simulations={simulations} stocks={stocks} marketData={marketData} db={db} user={user} confirmAction={confirmAction} showToast={showToast} t={t} lang={lang} />}
-          {activeTab === 'records' && <RecordsTab stocks={stocks} records={records} db={db} user={user} showToast={showToast} confirmAction={confirmAction} t={t} lang={lang} />}
+          {activeTab === 'records' && <RecordsTab stocks={stocks} records={records} liveQuotes={liveQuotes} db={db} user={user} showToast={showToast} confirmAction={confirmAction} t={t} lang={lang} />}
         </div>
       </main>
 
