@@ -1,6 +1,8 @@
 import logging
+import time
 from contextlib import asynccontextmanager
-from typing import Any
+from datetime import datetime
+from typing import Any, Awaitable, Callable
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -127,6 +129,31 @@ def _clean_symbol(symbol: str) -> str:
     return symbol.strip().upper()
 
 
+async def _cached_option_payload(
+    user_id: str,
+    cache_id: str,
+    ttl_seconds: int,
+    fetcher: Callable[[], Awaitable[dict[str, Any] | None]],
+) -> dict[str, Any] | None:
+    cached = store.get_doc("market_data_cache", cache_id, user_id)
+    now_ms = int(time.time() * 1000)
+    if cached and now_ms - int(cached.get("fetchedAt") or 0) < ttl_seconds * 1000:
+        return {**(cached.get("payload") or {}), "cacheHit": True}
+
+    fresh = await fetcher()
+    if fresh:
+        store.set_doc(
+            "market_data_cache",
+            cache_id,
+            {"payload": fresh, "fetchedAt": now_ms},
+            user_id=user_id,
+        )
+        return {**fresh, "cacheHit": False, "stale": False}
+    if cached and cached.get("payload"):
+        return {**cached["payload"], "cacheHit": True, "stale": True}
+    return None
+
+
 @app.get("/api/market/history")
 async def market_history(
     symbol: str,
@@ -150,6 +177,63 @@ async def market_search(
     q: str, _: AuthUser = Depends(require_owner)
 ) -> dict[str, Any]:
     return {"results": await market.search_symbols(q)}
+
+
+@app.get("/api/market/options/expirations")
+async def market_option_expirations(
+    symbol: str, user: AuthUser = Depends(require_owner)
+) -> dict[str, Any]:
+    symbol = _clean_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="invalid symbol")
+    payload = await _cached_option_payload(
+        user.id,
+        f"options_meta:{symbol}",
+        settings.options_meta_cache_ttl,
+        lambda: market.fetch_option_expirations(symbol),
+    )
+    if payload is None:
+        raise HTTPException(status_code=502, detail="Yahoo option data unavailable")
+    if not payload.get("expirations"):
+        raise HTTPException(status_code=404, detail="no options available")
+    return {key: value for key, value in payload.items() if not key.startswith("_")}
+
+
+@app.get("/api/market/options/chain")
+async def market_option_chain(
+    symbol: str,
+    expiry: str,
+    user: AuthUser = Depends(require_owner),
+) -> dict[str, Any]:
+    symbol = _clean_symbol(symbol)
+    if not symbol:
+        raise HTTPException(status_code=400, detail="invalid symbol")
+    try:
+        datetime.strptime(expiry, "%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="expiry must be YYYY-MM-DD") from exc
+
+    metadata = await _cached_option_payload(
+        user.id,
+        f"options_meta:{symbol}",
+        settings.options_meta_cache_ttl,
+        lambda: market.fetch_option_expirations(symbol),
+    )
+    if metadata is None:
+        raise HTTPException(status_code=502, detail="Yahoo option data unavailable")
+    expiry_timestamp = (metadata.get("_expirationTimestamps") or {}).get(expiry)
+    if expiry_timestamp is None:
+        raise HTTPException(status_code=404, detail="expiry not available")
+
+    payload = await _cached_option_payload(
+        user.id,
+        f"options_chain:{symbol}:{expiry}",
+        settings.options_chain_cache_ttl,
+        lambda: market.fetch_option_chain(symbol, expiry, expiry_timestamp),
+    )
+    if payload is None:
+        raise HTTPException(status_code=502, detail="Yahoo option chain unavailable")
+    return payload
 
 
 # --- AI ----------------------------------------------------------------------

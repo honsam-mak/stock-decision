@@ -1,3 +1,5 @@
+import { blackScholesPrice } from './optionsPricing.js';
+
 const finiteNumber = (value) => {
   if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
@@ -96,4 +98,104 @@ export function getExerciseImpact({
     shares,
     cashFlow: (action === 'Buy' ? -1 : 1) * shares * strikeValue,
   };
+}
+
+export function calcMarkToMarketPnL({
+  premium,
+  markPrice,
+  direction = 'long',
+  qty = 1,
+  multiplier = 100,
+}) {
+  const openingPremium = finiteNumber(premium);
+  const mark = finiteNumber(markPrice);
+  const quantity = finiteNumber(qty);
+  const contractMultiplier = finiteNumber(multiplier);
+  if ([openingPremium, mark, quantity, contractMultiplier].some((value) => value === null)) {
+    return null;
+  }
+  const longPnl = (mark - openingPremium) * quantity * contractMultiplier;
+  return normalizedDirection(direction) === 'short' ? -longPnl : longPnl;
+}
+
+export function buildValuationScenario({
+  prices,
+  optionType,
+  strike,
+  premium,
+  direction = 'long',
+  qty = 1,
+  multiplier = 100,
+  time,
+  rate = 0.045,
+  dividendYield = 0,
+  volatility,
+}) {
+  return prices.map((underlyingPrice) => {
+    const theoreticalPrice = blackScholesPrice({
+      spot: underlyingPrice,
+      strike,
+      time,
+      rate,
+      dividendYield,
+      volatility,
+      optionType,
+    });
+    return {
+      underlyingPrice,
+      todayPnL: theoreticalPrice === null ? null : calcMarkToMarketPnL({
+        premium,
+        markPrice: theoreticalPrice,
+        direction,
+        qty,
+        multiplier,
+      }),
+      expiryPnL: calcExpiryPnL({
+        optionType,
+        strike,
+        premium,
+        underlyingPrice,
+        direction,
+        qty,
+        multiplier,
+      }),
+    };
+  });
+}
+
+export function buildTimeDecaySeries({
+  days,
+  spot,
+  optionType,
+  strike,
+  premium,
+  direction = 'long',
+  qty = 1,
+  multiplier = 100,
+  rate = 0.045,
+  dividendYield = 0,
+  volatility,
+}) {
+  return days.map((daysRemaining) => {
+    const theoreticalPrice = blackScholesPrice({
+      spot,
+      strike,
+      time: Math.max(0, Number(daysRemaining)) / 365.25,
+      rate,
+      dividendYield,
+      volatility,
+      optionType,
+    });
+    return {
+      daysRemaining,
+      theoreticalPrice,
+      pnl: theoreticalPrice === null ? null : calcMarkToMarketPnL({
+        premium,
+        markPrice: theoreticalPrice,
+        direction,
+        qty,
+        multiplier,
+      }),
+    };
+  });
 }

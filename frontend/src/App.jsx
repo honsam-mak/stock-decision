@@ -1,5 +1,5 @@
 // Stock Decision v0.83 - local port (OpenSearch backend)
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { db, collection, doc, setDoc, onSnapshot, deleteDoc, getDoc, writeBatch } from './lib/firestoreShim.js';
 import { api } from './lib/api.js';
 import {
@@ -22,9 +22,25 @@ import {
 import {
   calcBreakeven,
   calcExpiryPnL,
+  calcMarkToMarketPnL,
   classifyMoneyness,
+  buildTimeDecaySeries,
+  buildValuationScenario,
   getExerciseImpact,
 } from './lib/payoff.js';
+import {
+  blackScholesPrice,
+  calculateGreeks,
+  impliedVolatility,
+  optionTimeValue,
+  yearsToExpiry,
+} from './lib/optionsPricing.js';
+import {
+  aggregateOptionPosition,
+  matchOptionContract,
+  optionContractKey,
+  positionKeys,
+} from './lib/optionChain.js';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, LabelList, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
 import { 
   TrendingUp, TrendingDown, LayoutDashboard, ListTodo, Database, 
@@ -170,6 +186,25 @@ const TRANSLATIONS = {
     "資金變動": "Cash Impact",
     "目前沒有可靠的標的報價；價內外判斷暫停，您仍可手動輸入情境價格。": "No reliable underlying quote is available. Moneyness is paused, but you can enter a scenario price manually.",
     "合約資料不完整，無法計算到期損益。": "Contract metadata is incomplete, so expiry PnL cannot be calculated.",
+    "期權鏈": "Option Chain",
+    "Yahoo 延遲行情，僅供分析參考": "Yahoo delayed data; for analysis only",
+    "報價可能過時": "Quote may be stale",
+    "低流動性": "Low liquidity",
+    "理論價": "Theoretical Price",
+    "內含價值": "Intrinsic Value",
+    "時間價值": "Time Value",
+    "剩餘日數": "Days Remaining",
+    "未實現損益": "Unrealized PnL",
+    "無風險利率": "Risk-free Rate",
+    "股息率": "Dividend Yield",
+    "今日理論損益 vs 到期損益": "Theoretical PnL Today vs Expiry PnL",
+    "今日理論損益": "Theoretical PnL Today",
+    "到期損益": "Expiry PnL",
+    "時間衰減情境": "Time Decay Scenario",
+    "載入中...": "Loading...",
+    "使用過時快取": "Using stale cache",
+    "即時估值與 Greeks": "Live Valuation & Greeks",
+    "此標的沒有可用的期權鏈": "No option chain is available for this symbol",
 
     // AI Features & Chat
     "✨ AI 洞察": "✨ AI Insights",
@@ -654,11 +689,11 @@ const FormattedMessage = ({ text }) => {
   );
 };
 
-const Modal = ({ isOpen, title, onClose, children, footer }) => {
+const Modal = ({ isOpen, title, onClose, children, footer, wide = false }) => {
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm animate-in fade-in duration-200">
-      <div className="bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-lg mx-4 overflow-hidden animate-in zoom-in-95 duration-200">
+      <div className={`bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl w-full ${wide ? 'max-w-6xl' : 'max-w-lg'} mx-4 overflow-hidden animate-in zoom-in-95 duration-200`}>
         <div className="flex justify-between items-center p-5 border-b border-slate-700">
           <div className="text-xl font-bold text-white">{title}</div>
           <button onClick={onClose} className="text-slate-400 hover:text-white transition-colors">
@@ -694,6 +729,365 @@ const Button = ({ children, onClick, variant = 'primary', icon: Icon, className 
       {Icon && <Icon size={18} />}
       {children}
     </button>
+  );
+};
+
+const AdvancedOptionAnalysis = ({ contract, record, underlyingPrice, t }) => {
+  const [riskFreeRate, setRiskFreeRate] = useState(4.5);
+  const [dividendYield, setDividendYield] = useState(0);
+  if (!contract) return null;
+
+  const spot = underlyingPrice === null || underlyingPrice === undefined
+    ? NaN
+    : Number(underlyingPrice);
+  const strike = Number(contract.strike);
+  const time = yearsToExpiry(contract.expiry);
+  const rate = Number(riskFreeRate) / 100;
+  const dividend = Number(dividendYield) / 100;
+  const mark = contract.mark === null || contract.mark === undefined
+    ? null
+    : Number(contract.mark);
+  const marketIv = Number(contract.iv);
+  const baseConfig = {
+    spot,
+    strike,
+    time,
+    rate,
+    dividendYield: dividend,
+    optionType: contract.optionType,
+  };
+  const volatility = Number.isFinite(marketIv) && marketIv > 0
+    ? marketIv
+    : impliedVolatility(mark, baseConfig);
+  const theoretical = volatility
+    ? blackScholesPrice({ ...baseConfig, volatility })
+    : null;
+  const greeks = volatility
+    ? calculateGreeks({ ...baseConfig, volatility })
+    : null;
+  const intrinsic = blackScholesPrice({
+    spot,
+    strike,
+    time: 0,
+    optionType: contract.optionType,
+  });
+  const timeValue = optionTimeValue(mark, intrinsic);
+  const direction = String(record?.action || '').toUpperCase() === 'SELL' ? 'short' : 'long';
+  const positionQty = Number(record?.openQty || record?.qty || 0);
+  const openingPremium = record
+    ? (record.price === null || record.price === undefined ? null : Number(record.price))
+    : mark;
+  const markPnL = record ? calcMarkToMarketPnL({
+    premium: record.price,
+    markPrice: mark,
+    direction,
+    qty: positionQty,
+    multiplier: Number(record.multiplier || 100),
+  }) : null;
+  const scenarioData = useMemo(() => {
+    if (!Number.isFinite(spot) || !volatility || !Number.isFinite(openingPremium)) return [];
+    const prices = Array.from({ length: 17 }, (_, index) => (
+      Number((spot * (0.7 + index * 0.0375)).toFixed(2))
+    ));
+    return buildValuationScenario({
+      prices,
+      optionType: contract.optionType,
+      strike,
+      premium: openingPremium,
+      direction,
+      qty: Math.max(positionQty, 1),
+      multiplier: Number(record?.multiplier || 100),
+      time,
+      rate,
+      dividendYield: dividend,
+      volatility,
+    });
+  }, [
+    spot, volatility, contract.optionType, strike, openingPremium, record?.multiplier,
+    direction, positionQty, time, rate, dividend,
+  ]);
+  const decayData = useMemo(() => {
+    if (!Number.isFinite(spot) || !volatility || !Number.isFinite(openingPremium)) return [];
+    const totalDays = Math.max(0, Math.ceil(time * 365.25));
+    const days = Array.from(new Set(
+      Array.from({ length: 9 }, (_, index) => Math.round(totalDays * (8 - index) / 8)),
+    ));
+    return buildTimeDecaySeries({
+      days,
+      spot,
+      optionType: contract.optionType,
+      strike,
+      premium: openingPremium,
+      direction,
+      qty: Math.max(positionQty, 1),
+      multiplier: Number(record?.multiplier || 100),
+      rate,
+      dividendYield: dividend,
+      volatility,
+    });
+  }, [
+    spot, volatility, contract.optionType, strike, openingPremium, record?.multiplier,
+    direction, positionQty, time, rate, dividend,
+  ]);
+  const format = (value, digits = 2) => (
+    value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value))
+      ? Number(value).toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })
+      : '-'
+  );
+  const money = (value) => format(value) === '-' ? '-' : `$${format(value)}`;
+
+  return (
+    <div className="space-y-4 border-t border-slate-700 pt-4 mt-4">
+      <div className="flex flex-wrap justify-between gap-2">
+        <div>
+          <div className="text-white font-bold">{contract.contractSymbol || `${contract.expiry} ${contract.strike} ${contract.optionType}`}</div>
+          <div className="text-xs text-slate-500">{t("Yahoo 延遲行情，僅供分析參考")}</div>
+        </div>
+        <div className="flex gap-2 text-xs">
+          {contract.quoteStale && <span className="px-2 py-1 rounded bg-amber-500/15 text-amber-300">{t("報價可能過時")}</span>}
+          {contract.illiquid && <span className="px-2 py-1 rounded bg-rose-500/15 text-rose-300">{t("低流動性")}</span>}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {[
+          ['Bid / Ask', `${money(contract.bid)} / ${money(contract.ask)}`],
+          ['Mark', money(contract.mark)],
+          [t("理論價"), money(theoretical)],
+          ['IV', volatility ? `${format(volatility * 100)}%` : '-'],
+          [t("內含價值"), money(intrinsic)],
+          [t("時間價值"), money(timeValue)],
+          [t("剩餘日數"), Math.max(0, Math.ceil(time * 365.25))],
+          [t("未實現損益"), markPnL === null ? '-' : `${markPnL >= 0 ? '+' : '-'}$${format(Math.abs(markPnL))}`],
+        ].map(([label, value]) => (
+          <div key={label} className="bg-slate-900 rounded-lg p-2.5">
+            <div className="text-[10px] uppercase text-slate-500">{label}</div>
+            <div className="text-sm text-white font-mono mt-1">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+        {[
+          ['Delta', greeks?.delta],
+          ['Gamma', greeks?.gamma],
+          ['Theta / day', greeks?.theta],
+          ['Vega / 1%', greeks?.vega],
+          ['Rho / 1%', greeks?.rho],
+        ].map(([label, value]) => (
+          <div key={label} className="border border-slate-700 rounded-lg p-2 text-center">
+            <div className="text-[10px] text-slate-500">{label}</div>
+            <div className="font-mono text-xs text-blue-300 mt-1">{format(value, 4)}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <label className="text-xs text-slate-400">
+          {t("無風險利率")} (%)
+          <input type="number" step="0.1" value={riskFreeRate} onChange={(event) => setRiskFreeRate(event.target.value)} className="mt-1 w-full bg-slate-950 border border-slate-700 rounded p-2 text-white font-mono" />
+        </label>
+        <label className="text-xs text-slate-400">
+          {t("股息率")} (%)
+          <input type="number" step="0.1" value={dividendYield} onChange={(event) => setDividendYield(event.target.value)} className="mt-1 w-full bg-slate-950 border border-slate-700 rounded p-2 text-white font-mono" />
+        </label>
+      </div>
+
+      {scenarioData.length > 0 && (
+        <div>
+          <div className="text-xs font-bold text-slate-300 mb-2">{t("今日理論損益 vs 到期損益")}</div>
+          <div className="h-52 bg-slate-950 rounded-lg p-2">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={scenarioData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                <XAxis dataKey="underlyingPrice" stroke="#94a3b8" fontSize={10} tickFormatter={(value) => `$${value}`} />
+                <YAxis stroke="#94a3b8" fontSize={10} tickFormatter={(value) => `$${Math.round(value)}`} />
+                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155' }} formatter={(value) => `$${format(value)}`} />
+                <ReferenceLine y={0} stroke="#64748b" />
+                <Line type="monotone" dataKey="todayPnL" name={t("今日理論損益")} stroke="#60a5fa" dot={false} strokeWidth={2} />
+                <Line type="monotone" dataKey="expiryPnL" name={t("到期損益")} stroke="#a78bfa" dot={false} strokeWidth={2} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+
+      {decayData.length > 1 && (
+        <div>
+          <div className="text-xs font-bold text-slate-300 mb-2">{t("時間衰減情境")}</div>
+          <div className="h-40 bg-slate-950 rounded-lg p-2">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={decayData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                <XAxis dataKey="daysRemaining" reversed stroke="#94a3b8" fontSize={10} />
+                <YAxis stroke="#94a3b8" fontSize={10} tickFormatter={(value) => `$${Math.round(value)}`} />
+                <Tooltip contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155' }} formatter={(value) => `$${format(value)}`} />
+                <ReferenceLine y={0} stroke="#64748b" />
+                <Line type="monotone" dataKey="pnl" name={t("未實現損益")} stroke="#34d399" dot={false} strokeWidth={2} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const OptionChainModal = ({ isOpen, symbol, openRecords, onClose, onChainLoaded, t }) => {
+  const [expirations, setExpirations] = useState([]);
+  const [expirationSymbol, setExpirationSymbol] = useState('');
+  const [selectedExpiry, setSelectedExpiry] = useState('');
+  const [chain, setChain] = useState(null);
+  const [selectedContract, setSelectedContract] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!isOpen || !symbol) return;
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    setChain(null);
+    setSelectedContract(null);
+    setExpirations([]);
+    setExpirationSymbol('');
+    setSelectedExpiry('');
+    api.optionExpirations(symbol)
+      .then((result) => {
+        if (cancelled) return;
+        const dates = result.expirations || [];
+        setExpirations(dates);
+        setExpirationSymbol(symbol);
+        setSelectedExpiry(dates[0] || '');
+      })
+      .catch((fetchError) => {
+        if (!cancelled) setError(fetchError.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [isOpen, symbol]);
+
+  useEffect(() => {
+    if (!isOpen || !symbol || expirationSymbol !== symbol || !selectedExpiry) return;
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    setChain(null);
+    setSelectedContract(null);
+    api.optionChain(symbol, selectedExpiry)
+      .then((result) => {
+        if (cancelled) return;
+        setChain(result);
+        onChainLoaded?.(result);
+      })
+      .catch((fetchError) => {
+        if (!cancelled) setError(fetchError.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [isOpen, symbol, expirationSymbol, selectedExpiry, onChainLoaded]);
+
+  const heldKeys = useMemo(() => positionKeys(openRecords), [openRecords]);
+  const heldRecord = useMemo(() => {
+    if (!selectedContract) return null;
+    const selectedKey = optionContractKey({ ...selectedContract, underlying: symbol });
+    return aggregateOptionPosition(openRecords, selectedKey);
+  }, [selectedContract, symbol, openRecords]);
+  const rows = useMemo(() => {
+    if (!chain) return [];
+    const byStrike = new Map();
+    (chain.calls || []).forEach((contract) => {
+      const key = Number(contract.strike);
+      byStrike.set(key, { ...(byStrike.get(key) || {}), strike: key, call: contract });
+    });
+    (chain.puts || []).forEach((contract) => {
+      const key = Number(contract.strike);
+      byStrike.set(key, { ...(byStrike.get(key) || {}), strike: key, put: contract });
+    });
+    const spot = chain.underlyingPrice === null || chain.underlyingPrice === undefined
+      ? NaN
+      : Number(chain.underlyingPrice);
+    return [...byStrike.values()]
+      .sort((a, b) => a.strike - b.strike)
+      .filter((row) => !Number.isFinite(spot) || Math.abs(row.strike / spot - 1) <= 0.35);
+  }, [chain]);
+  const priceCell = (contract, side) => {
+    if (!contract) return <span className="text-slate-700">-</span>;
+    const held = heldKeys.has(optionContractKey({ ...contract, underlying: symbol }));
+    return (
+      <button
+        onClick={() => setSelectedContract(contract)}
+        className={`w-full px-2 py-1.5 rounded text-left hover:bg-blue-500/15 ${held ? 'bg-emerald-500/10 ring-1 ring-emerald-500/40' : ''}`}
+      >
+        <div className="font-mono text-slate-200">{contract.mark == null ? '-' : `$${Number(contract.mark).toFixed(2)}`} {held && <span className="text-emerald-300">*</span>}</div>
+        <div className="text-[9px] text-slate-500">
+          {side} {contract.bid == null ? '-' : Number(contract.bid).toFixed(2)} / {contract.ask == null ? '-' : Number(contract.ask).toFixed(2)} · IV {contract.iv ? `${(contract.iv * 100).toFixed(1)}%` : '-'}
+        </div>
+      </button>
+    );
+  };
+
+  return (
+    <Modal isOpen={isOpen} wide title={`${symbol || ''} ${t("期權鏈")}`} onClose={onClose}>
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <select value={selectedExpiry} onChange={(event) => setSelectedExpiry(event.target.value)} className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white">
+            {expirations.map((expiry) => <option key={expiry} value={expiry}>{expiry}</option>)}
+          </select>
+          {chain && (
+            <span className="text-sm text-slate-400">
+              {t("標的現價")}: <span className="text-white font-mono">
+                {chain.underlyingPrice == null ? '-' : `$${Number(chain.underlyingPrice).toFixed(2)}`}
+              </span>
+            </span>
+          )}
+          {chain?.stale && <span className="text-xs px-2 py-1 rounded bg-amber-500/15 text-amber-300">{t("使用過時快取")}</span>}
+          <span className="text-xs text-slate-500">{t("Yahoo 延遲行情，僅供分析參考")}</span>
+        </div>
+
+        {loading && <div className="py-10 text-center text-slate-400"><Loader2 className="animate-spin inline mr-2" />{t("載入中...")}</div>}
+        {error && <div className="p-3 rounded-lg bg-rose-500/10 text-rose-300 text-sm">{error}</div>}
+        {!loading && !error && expirations.length === 0 && (
+          <div className="py-10 text-center text-slate-500">{t("此標的沒有可用的期權鏈")}</div>
+        )}
+
+        {!loading && chain && (
+          <div className="border border-slate-700 rounded-xl overflow-hidden">
+            <div className="grid grid-cols-[1fr_90px_1fr] bg-slate-900 text-xs font-bold text-slate-400 text-center py-2">
+              <div>CALLS · Mark / Bid / Ask / IV</div><div>Strike</div><div>PUTS · Mark / Bid / Ask / IV</div>
+            </div>
+            <div className="max-h-72 overflow-y-auto divide-y divide-slate-800">
+              {rows.map((row) => (
+                <div key={row.strike} className="grid grid-cols-[1fr_90px_1fr] items-center bg-slate-950/60">
+                  <div className="p-1">{priceCell(row.call, 'C')}</div>
+                  <div className={`text-center font-mono text-sm py-2 ${
+                    chain.underlyingPrice != null
+                    && Number(chain.underlyingPrice) > 0
+                    && Math.abs(row.strike - Number(chain.underlyingPrice)) / Number(chain.underlyingPrice) < 0.01
+                      ? 'text-amber-300 font-bold'
+                      : 'text-white'
+                  }`}>${row.strike}</div>
+                  <div className="p-1">{priceCell(row.put, 'P')}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {selectedContract && (
+          <AdvancedOptionAnalysis
+            contract={selectedContract}
+            record={heldRecord}
+            underlyingPrice={chain?.underlyingPrice}
+            t={t}
+          />
+        )}
+      </div>
+    </Modal>
   );
 };
 
@@ -1968,6 +2362,8 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
   const [selectedMonthForDetail, setSelectedMonthForDetail] = useState(null); 
   const [selectedTradeForClose, setSelectedTradeForClose] = useState(null);
   const [selectedStockForSchedule, setSelectedStockForSchedule] = useState(null);
+  const [selectedStockForChain, setSelectedStockForChain] = useState(null);
+  const [optionChains, setOptionChains] = useState({});
   const [cardViews, setCardViews] = useState({}); 
   const [showOnlyRealized, setShowOnlyRealized] = useState(true);
   const [calendarBaseDate, setCalendarBaseDate] = useState(new Date());
@@ -1975,6 +2371,25 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
   // 新增拖拉排序的狀態
   const [draggedIdx, setDraggedIdx] = useState(null);
   const [customOrder, setCustomOrder] = useState([]);
+
+  const rememberOptionChain = useCallback((chain) => {
+    if (!chain?.symbol || !chain?.expiry) return;
+    const key = `${chain.symbol}:${chain.expiry}`;
+    setOptionChains((current) => ({ ...current, [key]: chain }));
+  }, []);
+
+  const loadOptionChain = useCallback(async (symbol, expiry) => {
+    if (!symbol || !expiry) return null;
+    const key = `${symbol}:${expiry}`;
+    try {
+      const chain = await api.optionChain(symbol, expiry);
+      setOptionChains((current) => ({ ...current, [key]: chain }));
+      return chain;
+    } catch (error) {
+      console.warn(`Option chain unavailable for ${key}`, error);
+      return null;
+    }
+  }, []);
 
   // 從 Firebase 取得之前儲存的自訂排序 (改為 onSnapshot 即時監聽，支援匯入後立即更新)
   useEffect(() => {
@@ -2202,6 +2617,34 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
     return pnlMap;
   }, [records]);
 
+  const openOptionRecordsBySymbol = useMemo(() => Object.fromEntries(
+    Object.entries(pnlByStock).map(([symbol, data]) => [
+      symbol,
+      Object.values(data.lots).flatMap((lot) => (
+        lot.queue.filter((record) => isOptionTrade(record) && Number(record.openQty) > 0)
+      )),
+    ]),
+  ), [pnlByStock]);
+
+  useEffect(() => {
+    if (!selectedTradeForClose || !isOptionTrade(selectedTradeForClose)) return;
+    const meta = resolveOptionMeta(selectedTradeForClose);
+    loadOptionChain(meta.underlying, meta.expiry);
+  }, [selectedTradeForClose, loadOptionChain]);
+
+  useEffect(() => {
+    if (!selectedStockForSchedule) return;
+    const contracts = openOptionRecordsBySymbol[selectedStockForSchedule] || [];
+    const requests = new Map();
+    contracts.forEach((record) => {
+      const meta = resolveOptionMeta(record);
+      if (meta.underlying && meta.expiry) {
+        requests.set(`${meta.underlying}:${meta.expiry}`, [meta.underlying, meta.expiry]);
+      }
+    });
+    requests.forEach(([symbol, expiry]) => loadOptionChain(symbol, expiry));
+  }, [selectedStockForSchedule, openOptionRecordsBySymbol, loadOptionChain]);
+
   const scheduleData = useMemo(() => {
     if (!selectedStockForSchedule) return null;
     const stockData = pnlByStock[selectedStockForSchedule];
@@ -2221,20 +2664,58 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
                       (sum, record) => sum + Number(record.price || 0) * Number(record.openQty || 0),
                       0
                     ) / totalOpen;
-                    const currentPrice = Number(liveQuotes?.[meta.underlying]?.price);
+                    const chain = optionChains[`${meta.underlying}:${meta.expiry}`];
+                    const contract = matchOptionContract(chain, first);
+                    const currentPrice = Number(
+                      chain?.underlyingPrice ?? liveQuotes?.[meta.underlying]?.price
+                    );
+                    const direction = lot.direction === 1 ? 'Long' : 'Short';
+                    const time = yearsToExpiry(meta.expiry);
+                    const volatility = Number(contract?.iv) || impliedVolatility(
+                      contract?.mark,
+                      {
+                        spot: currentPrice,
+                        strike: meta.strike,
+                        time,
+                        rate: 0.045,
+                        dividendYield: 0,
+                        optionType: meta.optionType,
+                      },
+                    );
+                    const greeks = volatility ? calculateGreeks({
+                      spot: currentPrice,
+                      strike: meta.strike,
+                      time,
+                      rate: 0.045,
+                      dividendYield: 0,
+                      volatility,
+                      optionType: meta.optionType,
+                    }) : null;
                     openOptions.push({
                         assetName,
                         openQty: totalOpen,
-                        direction: lot.direction === 1 ? 'Long' : 'Short',
+                        direction,
                         expiryDate: optionExpiryDate(first),
                         meta,
                         premium,
+                        contract,
                         currentPrice: Number.isFinite(currentPrice) ? currentPrice : null,
                         breakeven: calcBreakeven({ ...meta, premium }),
                         moneyness: classifyMoneyness({
                           ...meta,
                           underlyingPrice: Number.isFinite(currentPrice) ? currentPrice : null,
                         }),
+                        daysToExpiry: Math.max(0, Math.ceil(time * 365.25)),
+                        markPnL: contract?.mark == null ? null : calcMarkToMarketPnL({
+                          premium,
+                          markPrice: contract.mark,
+                          direction,
+                          qty: totalOpen,
+                          multiplier: Number(first.multiplier || 100),
+                        }),
+                        iv: volatility,
+                        delta: greeks?.delta ?? null,
+                        stale: Boolean(chain?.stale || contract?.quoteStale),
                     });
                 }
             }
@@ -2304,7 +2785,7 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
     }
 
     return { options: openOptions, calendarDays };
-  }, [selectedStockForSchedule, pnlByStock, calendarBaseDate, liveQuotes]);
+  }, [selectedStockForSchedule, pnlByStock, calendarBaseDate, liveQuotes, optionChains]);
 
   // 修改 stockSymbolsWithRecords 以支援自訂排序
   const stockSymbolsWithRecords = useMemo(() => {
@@ -2358,6 +2839,11 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
       setSelectedTradeForClose(trade);
     }
   };
+  const selectedTradeMeta = resolveOptionMeta(selectedTradeForClose || {});
+  const selectedTradeChain = optionChains[
+    `${selectedTradeMeta.underlying}:${selectedTradeMeta.expiry}`
+  ];
+  const selectedTradeContract = matchOptionContract(selectedTradeChain, selectedTradeForClose);
 
   return (
     <div className="space-y-8 animate-in fade-in duration-500">
@@ -2406,6 +2892,13 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
                 <div className="flex justify-between items-start mb-4">
                   <h3 className="text-2xl font-bold text-white group-hover:text-blue-400 transition-colors">{symbol}</h3>
                   <div className="flex items-center gap-1">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setSelectedStockForChain(symbol); }}
+                        className="p-1.5 text-slate-500 hover:text-emerald-400 transition-colors rounded-lg hover:bg-emerald-500/10"
+                        title={t("期權鏈")}
+                      >
+                        <Activity size={18} />
+                      </button>
                       <button 
                         onClick={(e) => { e.stopPropagation(); setSelectedStockForSchedule(symbol); }} 
                         className="p-1.5 text-slate-500 hover:text-purple-400 transition-colors rounded-lg hover:bg-purple-500/10" 
@@ -2515,6 +3008,15 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
         showToast={showToast} 
         t={t} 
         lang={lang} 
+      />
+
+      <OptionChainModal
+        isOpen={!!selectedStockForChain}
+        symbol={selectedStockForChain}
+        openRecords={openOptionRecordsBySymbol[selectedStockForChain] || []}
+        onChainLoaded={rememberOptionChain}
+        onClose={() => setSelectedStockForChain(null)}
+        t={t}
       />
 
       <Modal 
@@ -2631,6 +3133,8 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
         confirmAction={confirmAction}
         t={t}
         currentQuote={liveQuotes?.[resolveOptionMeta(selectedTradeForClose || {}).underlying]}
+        optionContract={selectedTradeContract}
+        optionUnderlyingPrice={selectedTradeChain?.underlyingPrice}
         onClose={() => setSelectedTradeForClose(null)}
       />
 
@@ -2697,6 +3201,13 @@ const RecordsTab = ({ stocks, records, liveQuotes, db, user, showToast, confirmA
                              <span>{t("到期日")}: {o.meta.expiry || '-'}</span>
                              <span>{t("標的現價")}: {o.currentPrice == null ? '-' : `$${o.currentPrice.toFixed(2)}`}</span>
                              <span>{t("損益兩平")}: {o.breakeven == null ? '-' : `$${o.breakeven.toFixed(2)}`}</span>
+                             <span>{t("剩餘日數")}: {o.daysToExpiry}</span>
+                             <span>IV: {o.iv ? `${(o.iv * 100).toFixed(1)}%` : '-'}</span>
+                             <span>Delta: {o.delta == null ? '-' : o.delta.toFixed(4)}</span>
+                             <span className={o.markPnL == null ? '' : o.markPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                               Mark PnL: {o.markPnL == null ? '-' : `${o.markPnL >= 0 ? '+' : '-'}$${Math.abs(o.markPnL).toFixed(2)}`}
+                             </span>
+                             {o.stale && <span className="col-span-2 text-amber-400">{t("報價可能過時")}</span>}
                            </div>
                         </div>
                      ))}
@@ -2758,6 +3269,8 @@ const CloseTradeModal = ({
   confirmAction,
   t,
   currentQuote,
+  optionContract,
+  optionUnderlyingPrice,
 }) => {
   const [lifecycle, setLifecycle] = useState('close');
   const [closeQty, setCloseQty] = useState('');
@@ -2798,7 +3311,7 @@ const CloseTradeModal = ({
       ? (isLong ? 'Buy' : 'Sell')
       : (isLong ? 'Sell' : 'Buy')
   );
-  const currentUnderlyingPrice = Number(currentQuote?.price);
+  const currentUnderlyingPrice = Number(optionUnderlyingPrice ?? currentQuote?.price);
   const hasCurrentUnderlyingPrice = Number.isFinite(currentUnderlyingPrice);
   const breakeven = calcBreakeven({
     ...optionDetails,
@@ -2985,6 +3498,7 @@ const CloseTradeModal = ({
   return (
     <Modal
       isOpen={isOpen}
+      wide={Boolean(optionContract)}
       title={<div className="flex items-center gap-2"><Activity size={20} className="text-emerald-400" /> {t("平倉交易")}</div>}
       onClose={onClose}
       footer={
@@ -3069,6 +3583,18 @@ const CloseTradeModal = ({
                 {' @ '}${formatAmount(optionDetails.strike)}；{t("資金變動")} {exerciseImpact.cashFlow >= 0 ? '+' : '-'}${formatAmount(Math.abs(exerciseImpact.cashFlow))}
               </div>
             )}
+          </div>
+        )}
+
+        {isOption && optionContract && (
+          <div className="bg-slate-950 border border-slate-700 rounded-xl p-4">
+            <div className="text-sm font-bold text-emerald-300">{t("即時估值與 Greeks")}</div>
+            <AdvancedOptionAnalysis
+              contract={optionContract}
+              record={trade}
+              underlyingPrice={currentUnderlyingPrice}
+              t={t}
+            />
           </div>
         )}
 

@@ -40,6 +40,8 @@ class Settings(BaseSettings):
 
     # Seconds a cached market_data_cache entry stays fresh before refetching.
     market_cache_ttl: int = 8 * 60 * 60
+    options_meta_cache_ttl: int = 60 * 60
+    options_chain_cache_ttl: int = 10 * 60
 
     http_timeout: float = 20.0
 

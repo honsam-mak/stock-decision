@@ -45,6 +45,14 @@ export const api = {
 
   searchSymbols: (q) => request(`/market/search?q=${encodeURIComponent(q)}`),
 
+  optionExpirations: (symbol) =>
+    request(`/market/options/expirations?symbol=${encodeURIComponent(symbol)}`),
+
+  optionChain: (symbol, expiry) =>
+    request(
+      `/market/options/chain?symbol=${encodeURIComponent(symbol)}&expiry=${encodeURIComponent(expiry)}`,
+    ),
+
   aiGenerate: (prompt) =>
     request('/ai/generate', { method: 'POST', body: JSON.stringify({ prompt }) }),
 

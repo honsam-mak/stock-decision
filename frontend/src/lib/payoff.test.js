@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   buildScenarioPnL,
+  buildTimeDecaySeries,
+  buildValuationScenario,
   calcBreakeven,
   calcExpiryPnL,
+  calcMarkToMarketPnL,
   classifyMoneyness,
   getExerciseImpact,
 } from './payoff.js';
@@ -68,5 +71,41 @@ describe('option expiry analysis', () => {
       qty: 2,
       multiplier: 100,
     })).toEqual({ action: 'Buy', shares: 200, cashFlow: -10000 });
+  });
+
+  it('calculates mark PnL and pre-expiry scenario curves', () => {
+    expect(calcMarkToMarketPnL({
+      premium: 5, markPrice: 7, direction: 'long', qty: 2, multiplier: 100,
+    })).toBe(400);
+    expect(calcMarkToMarketPnL({
+      premium: 5, markPrice: 7, direction: 'short', qty: 2, multiplier: 100,
+    })).toBe(-400);
+
+    const scenarios = buildValuationScenario({
+      prices: [90, 100, 110],
+      optionType: 'call',
+      strike: 100,
+      premium: 5,
+      time: 30 / 365.25,
+      volatility: 0.25,
+    });
+    expect(scenarios).toHaveLength(3);
+    expect(scenarios[2].todayPnL).toBeGreaterThan(scenarios[0].todayPnL);
+    expect(scenarios[2].expiryPnL).toBe(500);
+  });
+
+  it('builds a time-decay series that converges to expiry value', () => {
+    const series = buildTimeDecaySeries({
+      days: [30, 7, 0],
+      spot: 100,
+      optionType: 'call',
+      strike: 100,
+      premium: 5,
+      volatility: 0.25,
+    });
+    expect(series).toHaveLength(3);
+    expect(series[0].theoreticalPrice).toBeGreaterThan(series[2].theoreticalPrice);
+    expect(series[2].theoreticalPrice).toBe(0);
+    expect(series[2].pnl).toBe(-500);
   });
 });

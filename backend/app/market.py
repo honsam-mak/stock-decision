@@ -6,6 +6,7 @@ primary source with Alpha Vantage as a fallback, mirroring the original
 fallback chain.
 """
 
+import math
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,12 +34,43 @@ def _round(value: Any) -> float | None:
         return None
 
 
+def _number(value: Any, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+        return round(number, digits) if math.isfinite(number) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int:
+    number = _number(value, 0)
+    return int(number) if number is not None else 0
+
+
 async def _yahoo_get(client: httpx.AsyncClient, path: str, params: dict) -> dict | None:
     for host in YAHOO_HOSTS:
         try:
             res = await client.get(f"{host}{path}", params=params, headers=YAHOO_HEADERS)
             if res.status_code == 200:
                 return res.json()
+            if res.status_code == 401:
+                # Yahoo's options endpoint requires a session cookie + crumb,
+                # while chart/search usually remain accessible without one.
+                await client.get("https://fc.yahoo.com", headers=YAHOO_HEADERS)
+                crumb_response = await client.get(
+                    f"{host}/v1/test/getcrumb", headers=YAHOO_HEADERS
+                )
+                crumb = crumb_response.text.strip() if crumb_response.status_code == 200 else ""
+                if crumb:
+                    retry = await client.get(
+                        f"{host}{path}",
+                        params={**params, "crumb": crumb},
+                        headers=YAHOO_HEADERS,
+                    )
+                    if retry.status_code == 200:
+                        return retry.json()
         except (httpx.HTTPError, ValueError):
             continue
     return None
@@ -185,3 +217,114 @@ async def search_symbols(query: str) -> list[dict]:
             }
         )
     return results
+
+
+def _unix_date(value: Any) -> str | None:
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _map_option_contract(raw: dict[str, Any], option_type: str) -> dict[str, Any]:
+    bid = _number(raw.get("bid"))
+    ask = _number(raw.get("ask"))
+    last = _number(raw.get("lastPrice"))
+    has_spread = bid is not None and ask is not None and bid > 0 and ask > 0
+    mark = _number((bid + ask) / 2) if has_spread else last
+    iv = _number(raw.get("impliedVolatility"), 6)
+    if iv is not None and (iv < 0 or iv > 10):
+        iv = None
+
+    return {
+        "contractSymbol": raw.get("contractSymbol") or "",
+        "optionType": option_type,
+        "strike": _number(raw.get("strike")),
+        "expiry": _unix_date(raw.get("expiration")),
+        "bid": bid,
+        "ask": ask,
+        "mark": mark,
+        "last": last,
+        "volume": _safe_int(raw.get("volume")),
+        "openInterest": _safe_int(raw.get("openInterest")),
+        "iv": iv,
+        "inTheMoney": bool(raw.get("inTheMoney")),
+        "lastTradeAt": _unix_date(raw.get("lastTradeDate")),
+        "quoteStale": not has_spread,
+        "illiquid": not has_spread and not (last and last > 0),
+    }
+
+
+def _option_result(data: dict | None) -> dict[str, Any] | None:
+    results = (data or {}).get("optionChain", {}).get("result") or []
+    return results[0] if results else None
+
+
+def _parse_option_expirations(data: dict | None, symbol: str) -> dict[str, Any] | None:
+    result = _option_result(data)
+    if result is None:
+        return None
+    timestamps = [
+        int(value)
+        for value in (result.get("expirationDates") or [])
+        if _unix_date(value)
+    ]
+    timestamp_map = {_unix_date(value): value for value in timestamps}
+    quote = result.get("quote") or {}
+    return {
+        "symbol": (result.get("underlyingSymbol") or symbol).upper(),
+        "underlyingPrice": _number(quote.get("regularMarketPrice")),
+        "expirations": list(timestamp_map),
+        "_expirationTimestamps": timestamp_map,
+        "dataSource": "yahoo_delayed",
+    }
+
+
+def _parse_option_chain(
+    data: dict | None, symbol: str, requested_expiry: str
+) -> dict[str, Any] | None:
+    result = _option_result(data)
+    if result is None:
+        return None
+    option_blocks = result.get("options") or []
+    if not option_blocks:
+        return None
+    block = option_blocks[0]
+    expiry = _unix_date(block.get("expirationDate")) or requested_expiry
+    quote = result.get("quote") or {}
+    return {
+        "symbol": (result.get("underlyingSymbol") or symbol).upper(),
+        "expiry": expiry,
+        "underlyingPrice": _number(quote.get("regularMarketPrice")),
+        "calls": [
+            _map_option_contract(contract, "call")
+            for contract in (block.get("calls") or [])
+        ],
+        "puts": [
+            _map_option_contract(contract, "put")
+            for contract in (block.get("puts") or [])
+        ],
+        "dataSource": "yahoo_delayed",
+    }
+
+
+async def fetch_option_expirations(symbol: str) -> dict[str, Any] | None:
+    async with httpx.AsyncClient(
+        timeout=settings.http_timeout, follow_redirects=True
+    ) as client:
+        data = await _yahoo_get(client, f"/v7/finance/options/{symbol}", {})
+    return _parse_option_expirations(data, symbol)
+
+
+async def fetch_option_chain(
+    symbol: str, expiry: str, expiry_timestamp: int
+) -> dict[str, Any] | None:
+    async with httpx.AsyncClient(
+        timeout=settings.http_timeout, follow_redirects=True
+    ) as client:
+        data = await _yahoo_get(
+            client,
+            f"/v7/finance/options/{symbol}",
+            {"date": int(expiry_timestamp)},
+        )
+    return _parse_option_chain(data, symbol, expiry)
