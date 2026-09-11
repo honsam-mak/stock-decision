@@ -191,11 +191,24 @@ async def fetch_quote(symbol: str) -> dict | None:
                     name = quote.get("longname") or quote.get("shortname") or symbol
                     break
 
+        market_time = meta.get("regularMarketTime")
+        offset = meta.get("gmtoffset") or 0
+        date = None
+        if market_time:
+            try:
+                date = datetime.fromtimestamp(
+                    int(market_time) + int(offset), tz=timezone.utc
+                ).strftime("%Y-%m-%d")
+            except (TypeError, ValueError, OSError):
+                date = None
+
         return {
             "name": name,
             "price": price,
             "change": change if change is not None else 0,
             "changePct": change_pct if change_pct is not None else 0,
+            "date": date,
+            "previousClose": _round(prev_close),
         }
 
 

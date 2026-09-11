@@ -1418,7 +1418,31 @@ const Dashboard = ({ stocks, marketData, liveQuotes, loadingQuotes, db, user, co
                   trafficTooltip = t("同步成功");
               }
               
-              const rawSparklineData = history.slice(Math.max(0, history.length - 5));
+              // Yahoo 的日線序列在盤中／收盤後可能還沒補上今天那根，
+              // 此時即時報價已經是今天的價位，直接畫 history 會漏掉最新一天。
+              const livePrice = (!isMockData && quote && quote.price !== null && quote.price !== undefined && !isNaN(quote.price))
+                ? Number(quote.price)
+                : null;
+              let chartHistory = history;
+
+              if (livePrice !== null) {
+                const lastBar = history[history.length - 1];
+                if (quote.date && quote.date === lastBar.date) {
+                  chartHistory = [...history.slice(0, -1), { ...lastBar, close: livePrice }];
+                } else if (quote.date && quote.date > lastBar.date) {
+                  chartHistory = [...history, {
+                    date: quote.date,
+                    open: livePrice,
+                    high: livePrice,
+                    low: livePrice,
+                    close: livePrice,
+                    volume: 0,
+                    isMock: false
+                  }];
+                }
+              }
+
+              const rawSparklineData = chartHistory.slice(Math.max(0, chartHistory.length - 5));
               let maxVal = -Infinity, minVal = Infinity;
               let maxIdx = 0, minIdx = 0;
               
@@ -1444,8 +1468,11 @@ const Dashboard = ({ stocks, marketData, liveQuotes, loadingQuotes, db, user, co
                  let qChange = quote.change;
                  let qChangePct = quote.changePct;
                  
-                 const histChange = currentPrice - yesterdayData.close;
-                 const histChangePct = yesterdayData.close ? (histChange / yesterdayData.close) * 100 : 0;
+                 const prevClose = (quote.previousClose !== null && quote.previousClose !== undefined && !isNaN(quote.previousClose))
+                   ? Number(quote.previousClose)
+                   : yesterdayData.close;
+                 const histChange = currentPrice - prevClose;
+                 const histChangePct = prevClose ? (histChange / prevClose) * 100 : 0;
 
                  if (qChange !== null && qChange !== undefined && !isNaN(qChange)) {
                      if (qChange === 0 && Math.abs(histChange) > 0.005 && Math.abs(histChangePct) < 15) {
